@@ -1,0 +1,6 @@
+# JitPack build config — https://jitpack.io/docs/
+# The library needs JDK 17 (AGP 8) ; JitPack defaults to 8.
+jdk:
+  - openjdk17
+install:
+  - ./gradlew :salescentral:publishToMavenLocal
