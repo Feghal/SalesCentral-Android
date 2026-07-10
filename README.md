@@ -35,9 +35,22 @@ excluded from production analytics, and Play purchases are rejected —
 the SDK leaves rejected purchases unacknowledged, so Google auto-refunds
 them after 3 days and no money is silently kept.
 
+For **subscriptions**, also connect Real-Time Developer Notifications:
+create a Cloud Pub/Sub topic, point Play Console → Monetization setup →
+RTDN at it, and add a push subscription targeting the app's
+**"Google Play RTDN"** URL (shown on the admin App Detail page). Renewals,
+cancellations, revocations and refunds then arrive server-side like
+Apple's webhook. The server also lazily re-validates any Play subscription
+that looks expired, so a missed notification self-heals on the next
+app foreground.
+
+Optional, recommended at scale: enable "Manage and download my response
+encryption keys" in Play Console → App integrity and paste the two keys
+into the same admin card — integrity tokens are then verified locally
+(no decodeIntegrityToken API quota). Free trials and actual paid prices
+are resolved via the Play `orders` API automatically.
+
 Design details: `docs/superpowers/specs/2026-07-09-google-play-backend-design.md`.
-Known limitation: Play subscription free-trial phases are recorded as
-ordinary purchases (Apple-style trial analytics don't apply yet).
 
 ## Install
 
