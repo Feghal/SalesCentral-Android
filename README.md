@@ -84,7 +84,7 @@ dependencyResolutionManagement {
 
 // app/build.gradle.kts
 dependencies {
-    implementation("com.github.Feghal:SalesCentral-Android:1.2.1")
+    implementation("com.github.Feghal:SalesCentral-Android:1.3.0")
 }
 ```
 
