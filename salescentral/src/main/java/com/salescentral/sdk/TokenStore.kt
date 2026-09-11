@@ -42,6 +42,14 @@ interface TokenStore {
     fun readAttestKeyId(): String? = null
     fun writeAttestKeyId(id: String) {}
     fun clearAttestKeyId() {}
+
+    /**
+     * Last `analyticsOnly` the SERVER reported for this platform (SDK 1.3.0).
+     * App configuration, not identity: [clear] / [clearClientId] leave it
+     * alone. Default: never cached (`null`).
+     */
+    fun readServerAnalyticsOnly(): Boolean? = null
+    fun writeServerAnalyticsOnly(value: Boolean) {}
 }
 
 /**
@@ -63,6 +71,7 @@ class SharedPrefsTokenStore(
         const val KEY_TOKEN = "user_token"
         const val KEY_CLIENT_ID = "client_id"
         const val KEY_ATTEST_KEY_ID = "attest_key_id"
+        const val KEY_SERVER_ANALYTICS_ONLY = "server_analytics_only"
     }
 
     override fun read(): String? = prefs.getString(KEY_TOKEN, null)
@@ -76,6 +85,10 @@ class SharedPrefsTokenStore(
     override fun readAttestKeyId(): String? = prefs.getString(KEY_ATTEST_KEY_ID, null)
     override fun writeAttestKeyId(id: String) { prefs.edit().putString(KEY_ATTEST_KEY_ID, id).apply() }
     override fun clearAttestKeyId() { prefs.edit().remove(KEY_ATTEST_KEY_ID).apply() }
+
+    override fun readServerAnalyticsOnly(): Boolean? =
+        if (prefs.contains(KEY_SERVER_ANALYTICS_ONLY)) prefs.getBoolean(KEY_SERVER_ANALYTICS_ONLY, false) else null
+    override fun writeServerAnalyticsOnly(value: Boolean) { prefs.edit().putBoolean(KEY_SERVER_ANALYTICS_ONLY, value).apply() }
 }
 
 /** In-memory store — useful for unit tests. */
@@ -84,6 +97,7 @@ class InMemoryTokenStore(initial: String? = null) : TokenStore {
     private var token: String? = initial
     private var clientId: String? = null
     private var attestKeyId: String? = null
+    private var serverAnalyticsOnly: Boolean? = null
 
     override fun read(): String? = synchronized(lock) { token }
     override fun write(token: String) = synchronized(lock) { this.token = token }
@@ -96,4 +110,7 @@ class InMemoryTokenStore(initial: String? = null) : TokenStore {
     override fun readAttestKeyId(): String? = synchronized(lock) { attestKeyId }
     override fun writeAttestKeyId(id: String) = synchronized(lock) { attestKeyId = id }
     override fun clearAttestKeyId() = synchronized(lock) { attestKeyId = null }
+
+    override fun readServerAnalyticsOnly(): Boolean? = synchronized(lock) { serverAnalyticsOnly }
+    override fun writeServerAnalyticsOnly(value: Boolean) = synchronized(lock) { serverAnalyticsOnly = value }
 }

@@ -64,6 +64,33 @@ class SalesClient(
                 "or pass a TokenStore in the config.",
         )
 
+    /**
+     * Server-driven analytics-only (SDK 1.3.0). Android has no client-side
+     * key: the server's per-platform hint, delivered in every config bundle,
+     * is the only source. Seeded from the TokenStore cache so relaunches are
+     * right before bootstrap; `@Volatile` because the facade reads it from
+     * other threads.
+     */
+    @Volatile private var serverAnalyticsOnly: Boolean = tokenStore.readServerAnalyticsOnly() ?: false
+    val analyticsOnly: Boolean get() = serverAnalyticsOnly
+
+    /** First statement of every transaction API. */
+    private fun guardTransactionsAllowed(operation: String) {
+        if (serverAnalyticsOnly) {
+            SalesLog.warn(SalesLog.Category.SDK, "$operation blocked — server reports analyticsOnly for this platform")
+            throw SalesError.InvalidState("analytics_only")
+        }
+    }
+
+    /** Absorb the server's hint when the bundle carries it (absent ≠ false). */
+    private fun absorbAnalyticsOnly(resp: JSONObject) {
+        if (resp.has("analyticsOnly") && !resp.isNull("analyticsOnly")) {
+            val v = resp.getBoolean("analyticsOnly")
+            serverAnalyticsOnly = v
+            tokenStore.writeServerAnalyticsOnly(v)
+        }
+    }
+
     // ------------------------------------------------------------------
     // State (guarded by `lock`; snapshots returned to callers)
     // ------------------------------------------------------------------
@@ -238,6 +265,7 @@ class SalesClient(
      * Persists the rotated token, refreshes the in-memory caches.
      */
     private fun absorbBundle(resp: JSONObject): SalesUser {
+        absorbAnalyticsOnly(resp)
         val token = resp.optString("token", "")
         val user = resp.optJSONObject("user")?.let { SalesUser.fromJson(it) }
             ?: throw SalesError.Decoding("bundle response: missing 'user'")
@@ -340,6 +368,7 @@ class SalesClient(
         receipts: List<String>? = null,
         context: UserContext = defaultUserContext(),
     ): RestoreResult {
+        guardTransactionsAllowed("restorePurchases")
         val receiptList = receipts ?: receiptsProvider?.invoke() ?: emptyList()
         if (receiptList.isEmpty()) {
             // No prior purchases on this device — fall back to a plain
@@ -378,6 +407,7 @@ class SalesClient(
             resp.remoteConfig?.let { _remoteConfigCache = it }
             resp.experimentAssignments?.let { _experimentAssignments = it }
         }
+        absorbAnalyticsOnly(respJson)
         return resp
     }
 
@@ -493,6 +523,7 @@ class SalesClient(
      * section for the state of Google Play validation.
      */
     suspend fun applyReceipts(receipts: List<String>): ApplyResult {
+        guardTransactionsAllowed("applyReceipts")
         if (receipts.isEmpty()) {
             throw SalesError.InvalidState("applyReceipts called with empty receipts")
         }
@@ -515,6 +546,7 @@ class SalesClient(
      * "is this user paid right now?" — performs lazy server-side expiry.
      */
     suspend fun currentSubscription(): CurrentSubscriptionResponse {
+        guardTransactionsAllowed("currentSubscription")
         val resp = request(
             SalesConfig.Endpoint.CURRENT_SUBSCRIPTION,
             method = "GET",
@@ -546,6 +578,7 @@ class SalesClient(
      * that reaches the server debits.
      */
     suspend fun spendCredits(amount: Int, reason: String, idempotencyKey: String? = null): Credits {
+        guardTransactionsAllowed("spendCredits")
         val body = JSONObject().apply {
             put("amount", amount)
             put("reason", reason)
@@ -586,6 +619,7 @@ class SalesClient(
      *   - `"rewards_disabled"`(404) — feature off for this app.
      */
     suspend fun claimReward(): RetentionClaimResult {
+        guardTransactionsAllowed("claimReward")
         val token = config.tokens.claimReward
         if (token.isNullOrEmpty()) {
             throw SalesError.InvalidState(
