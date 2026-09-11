@@ -21,7 +21,12 @@ site keeps compiling; see "Changed" for the two signature changes.
   it at the FRONT (order preserved), validation-class 4xx drop it with a
   `SalesLog` warning. Known limitations, same as iOS: memory-only (lost on
   process kill), no idempotency key (a lost 2xx can duplicate a batch on
-  retry), and `clearUser()` empties the queue.
+  retry), and `clearUser()` empties the queue — **an event tracked
+  immediately before `clearUser()` or process exit is dropped** before it
+  ever reaches the wire; `await flush()` first if you need it delivered
+  (e.g. a final `sign_out`-style event). `clearUser()` now logs a
+  `SalesLog.warn` naming how many queued items it discarded, so a non-zero
+  drop is at least visible in logcat even when that call was skipped.
 - `occurredAt` on events: `SalesClient.track(name, properties, occurredAt =
   now)` and `SalesEvent.occurredAt` (defaults to construction time) put the
   ENQUEUE time on the wire, so a late flush no longer skews timelines.
@@ -42,8 +47,14 @@ site keeps compiling; see "Changed" for the two signature changes.
   Source-compatible for the usual call sites (calling a plain function from
   a coroutine is fine; `SessionTracker` and `SalesStore` were updated); a
   caller that passed `::track` as a `suspend` function reference needs a
-  lambda. `recordSession` no longer throws: retryable failures queue,
-  permanent ones are logged and dropped.
+  lambda. **Binary-incompatible**, though, for anyone consuming a
+  precompiled artifact: dropping `suspend` changes the JVM method signature
+  (it drops the trailing `Continuation` parameter and the `Any?` return
+  used to bridge suspension), so a module built against 1.1.0 and shipped
+  as an AAR/JAR — not rebuilt from source against 1.2.0 — can fail to link
+  at runtime even though its *source* still compiles unchanged against
+  1.2.0. Recompile any such dependent. `recordSession` no longer throws:
+  retryable failures queue, permanent ones are logged and dropped.
 - `track` used to POST the single-event wire shape (`{name, properties,
   occurredAt}`); everything now goes out as the batch shape
   (`{events: [...]}`), which the events endpoint has always accepted.

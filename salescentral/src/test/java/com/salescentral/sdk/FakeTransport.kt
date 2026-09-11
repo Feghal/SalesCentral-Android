@@ -1,5 +1,7 @@
 package com.salescentral.sdk
 
+import android.content.Context
+import android.content.ContextWrapper
 import kotlinx.coroutines.CompletableDeferred
 import java.io.IOException
 import java.util.Collections
@@ -84,20 +86,44 @@ object TestFixtures {
     )
 
     /**
+     * A bare, never-functional [Context]: enough to satisfy
+     * [SalesClient]'s `androidContext ?: return` null-check so the reconnect
+     * monitor's start/stop path actually runs, but no method on it may be
+     * called — `ContextWrapper`'s delegating implementations would NPE on
+     * the null base. Tests that need this pair it with a
+     * [networkMonitorFactory] that ignores the `Context` it's handed (a real
+     * `ConnectivityManager` can't be constructed in a plain JVM unit test —
+     * see [ConnectivityRegistrar]'s doc).
+     */
+    fun fakeAndroidContext(): Context = object : ContextWrapper(null) {}
+
+    /**
      * [outboxScope] drives the client's automatic analytics drain. The
      * default is the SDK's own background scope; event tests pass
      * `runTest`'s `backgroundScope` (or a scope on a test dispatcher) so
      * the automatic drain runs only when the test advances the scheduler.
+     *
+     * [androidContext] defaults to none (matching [SalesClient]'s own
+     * constructor default); pass [fakeAndroidContext] together with
+     * [networkMonitorFactory] (set post-construction — see
+     * [SalesClient.networkMonitorFactory]) to exercise the reconnect-monitor
+     * lifecycle with a fake [ReconnectMonitor].
      */
-    fun client(
+    internal fun client(
         transport: FakeTransport,
         store: TokenStore = InMemoryTokenStore(),
         clock: java.time.Clock = java.time.Clock.systemUTC(),
         outboxScope: kotlinx.coroutines.CoroutineScope? = null,
-    ): SalesClient = if (outboxScope == null) {
-        SalesClient(config(store), transport, clock = clock)
-    } else {
-        SalesClient(config(store), transport, clock = clock, outboxScope = outboxScope)
+        androidContext: Context? = null,
+        networkMonitorFactory: ((Context) -> ReconnectMonitor)? = null,
+    ): SalesClient {
+        val client = if (outboxScope == null) {
+            SalesClient(config(store), transport, clock = clock, androidContext = androidContext)
+        } else {
+            SalesClient(config(store), transport, clock = clock, outboxScope = outboxScope, androidContext = androidContext)
+        }
+        if (networkMonitorFactory != null) client.networkMonitorFactory = networkMonitorFactory
+        return client
     }
 
     /**

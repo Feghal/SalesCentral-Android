@@ -419,4 +419,127 @@ class SalesClientOutboxTest {
         assertEquals("jwt-2", transport.requests.last().headers["x-user-token"])
         assertEquals(0, client.pendingAnalyticsCount)
     }
+
+    // ------------------------------------------------------------------
+    // Reconnect monitor
+    // ------------------------------------------------------------------
+
+    /**
+     * Records start/stop calls so a test can prove the monitor's lifecycle
+     * without a real `ConnectivityManager` (see [ConnectivityRegistrar]'s
+     * doc for why one can't be constructed in this module's unit tests).
+     */
+    private class SpyReconnectMonitor : ReconnectMonitor {
+        override var onReconnect: (() -> Unit)? = null
+        var startCalls = 0
+        var stopCalls = 0
+
+        override fun start() {
+            startCalls++
+        }
+
+        override fun stop() {
+            stopCalls++
+        }
+    }
+
+    // These tests seed the token store directly (`InMemoryTokenStore("jwt-1")`)
+    // instead of calling `ensureUser()`: with a non-null `androidContext` (needed
+    // so `startOutboxReconnectMonitorIfNeeded` runs past its `androidContext ?:
+    // return` guard), `ensureUser()` collects a `UserContext` from it, and
+    // `DeviceContext.isEmulator()` dereferences `Build.FINGERPRINT` — always null
+    // under this module's plain-JVM `unitTests.isReturnDefaultValues` stub jar,
+    // regardless of this fix. Unrelated to the reconnect monitor; sidestepped
+    // rather than fixed here.
+
+    @Test
+    fun `a working transport never starts the reconnect monitor`() = runTest {
+        val transport = FakeTransport()
+        val spy = SpyReconnectMonitor()
+        var factoryCalls = 0
+        val client = TestFixtures.client(
+            transport,
+            InMemoryTokenStore("jwt-1"),
+            outboxScope = TestFixtures.parkedScope(),
+            androidContext = TestFixtures.fakeAndroidContext(),
+            networkMonitorFactory = { factoryCalls++; spy },
+        )
+
+        client.track("a")
+        // The caller's path (enqueue) never touches the monitor — proven
+        // before any drain has even run.
+        assertEquals(0, factoryCalls)
+        assertEquals(0, spy.startCalls)
+
+        transport.enqueue(200, """{ "ok": true }""")
+        assertEquals(FlushResult.Delivered(1), client.flush())
+
+        // A successful drain never hit a Retryable return, so it still
+        // never touched the monitor.
+        assertEquals(0, factoryCalls)
+        assertEquals(0, spy.startCalls)
+    }
+
+    @Test
+    fun `a 5xx pass starts the reconnect monitor`() = runTest {
+        val transport = FakeTransport()
+        val spy = SpyReconnectMonitor()
+        val client = TestFixtures.client(
+            transport,
+            InMemoryTokenStore("jwt-1"),
+            outboxScope = TestFixtures.parkedScope(),
+            androidContext = TestFixtures.fakeAndroidContext(),
+            networkMonitorFactory = { spy },
+        )
+
+        client.track("a")
+        transport.enqueue(503, """{ "error": "unavailable" }""")
+        assertEquals(FlushResult.Retryable("HTTP 503 unavailable"), client.flush())
+
+        assertEquals(1, spy.startCalls)
+        assertEquals(0, spy.stopCalls)
+    }
+
+    @Test
+    fun `a subsequent successful drain stops the reconnect monitor`() = runTest {
+        val transport = FakeTransport()
+        val spy = SpyReconnectMonitor()
+        val client = TestFixtures.client(
+            transport,
+            InMemoryTokenStore("jwt-1"),
+            outboxScope = TestFixtures.parkedScope(),
+            androidContext = TestFixtures.fakeAndroidContext(),
+            networkMonitorFactory = { spy },
+        )
+
+        client.track("a")
+        transport.enqueue(503, """{ "error": "unavailable" }""")
+        assertEquals(FlushResult.Retryable("HTTP 503 unavailable"), client.flush())
+        assertEquals(1, spy.startCalls)
+        assertEquals(0, spy.stopCalls)
+
+        transport.enqueue(200, """{ "ok": true }""")
+        assertEquals(FlushResult.Delivered(1), client.flush())
+
+        assertEquals(1, spy.startCalls) // not started again — already running
+        assertEquals(1, spy.stopCalls)
+    }
+
+    @Test
+    fun `no user token yet is retryable and also starts the reconnect monitor`() = runTest {
+        val transport = FakeTransport()
+        val spy = SpyReconnectMonitor()
+        val client = TestFixtures.client(
+            transport,
+            outboxScope = TestFixtures.parkedScope(),
+            androidContext = TestFixtures.fakeAndroidContext(),
+            networkMonitorFactory = { spy },
+        )
+
+        client.track("app_launch")
+        assertEquals(FlushResult.Retryable("no user token yet"), client.flush())
+
+        assertEquals(1, spy.startCalls)
+        assertEquals(0, transport.requests.size)
+    }
 }

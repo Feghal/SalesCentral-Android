@@ -395,7 +395,20 @@ class SalesClient(
             _remoteConfigCache = emptyMap()
             _experimentAssignments = emptyMap()
         }
+        // The outbox is memory-only and unconditional here: anything queued
+        // — including an event tracked moments ago that hasn't sent yet —
+        // is gone, not just for this user but for good. Callers that need a
+        // final event delivered (a `sign_out`-style one, say) must `await
+        // flush()` before calling this. No behaviour change, just visibility
+        // into how often that guidance is skipped.
+        val pendingDropped = outbox.count
         outbox.removeAll()
+        if (pendingDropped > 0) {
+            SalesLog.warn(
+                SalesLog.Category.OUTBOX,
+                "clearUser() dropped $pendingDropped queued analytics item(s) that had not been sent yet",
+            )
+        }
         stopOutboxReconnectMonitorIfDrained()
     }
 
@@ -619,7 +632,18 @@ class SalesClient(
      * per backlog; stopped once drained). Null on a context-less client
      * (unit tests) — there is no reconnect trigger there.
      */
-    private var outboxReconnectMonitor: NetworkMonitor? = null
+    private var outboxReconnectMonitor: ReconnectMonitor? = null
+
+    /**
+     * Creates the connectivity watcher [startOutboxReconnectMonitorIfNeeded]
+     * starts. `internal var` rather than a constructor parameter: the
+     * primary constructor is public SDK API (JitPack consumers construct
+     * [SalesClient] directly per its class doc), and a public constructor
+     * cannot accept a parameter typed with the SDK-internal
+     * [ReconnectMonitor] — Kotlin's `EXPOSED_PARAMETER_TYPE` check rejects
+     * it. Tests in this module set this directly to inject a fake.
+     */
+    internal var networkMonitorFactory: (Context) -> ReconnectMonitor = { ctx -> NetworkMonitor(ctx) }
 
     /** Number of analytics items queued and not yet acknowledged by the server. */
     val pendingAnalyticsCount: Int get() = outbox.count
@@ -688,13 +712,22 @@ class SalesClient(
      */
     suspend fun flush(): FlushResult = flushMutex.withLock { drainPass() }
 
+    /**
+     * Append-only: never touches [outboxReconnectMonitor] or any
+     * `ConnectivityManager` API. The reconnect monitor is started from
+     * [drainPass] instead, only once a pass actually hits a retryable
+     * failure — otherwise every `track()` in steady state (a working
+     * transport, items draining as fast as they're queued) would perform a
+     * `registerDefaultNetworkCallback` binder call on the CALLER's thread
+     * (the main thread for `SessionTracker.background()`), immediately
+     * undone by the next drain pass.
+     */
     private fun enqueue(items: List<OutboxItem>) {
         val dropped = outbox.append(items)
         if (dropped > 0) {
             SalesLog.warn(SalesLog.Category.OUTBOX, "outbox over cap — dropped $dropped oldest item(s)")
         }
         SalesLog.info(SalesLog.Category.OUTBOX, "queued ${describe(items)} — ${outbox.count} pending")
-        startOutboxReconnectMonitorIfNeeded()
         requestFlush()
     }
 
@@ -741,6 +774,7 @@ class SalesClient(
         if (outbox.isEmpty) return FlushResult.NothingToSend
         if (tokenStore.read() == null) {
             SalesLog.debug(SalesLog.Category.OUTBOX, "flush skipped — no user token yet (${outbox.count} pending)")
+            startOutboxReconnectMonitorIfNeeded()
             return FlushResult.Retryable("no user token yet")
         }
         SalesLog.info(SalesLog.Category.OUTBOX, "flushing ${outbox.count} queued item(s)")
@@ -782,6 +816,7 @@ class SalesClient(
                         SalesLog.Category.OUTBOX,
                         "flush stopped — retryable failure, ${outbox.count} item(s) kept: $reason",
                     )
+                    startOutboxReconnectMonitorIfNeeded()
                     return FlushResult.Retryable(reason)
                 }
                 lastPermanent = reason
@@ -873,11 +908,20 @@ class SalesClient(
         return if (items.size == 1) head else "${items.size} item(s) starting with $head"
     }
 
+    /**
+     * Called only from [drainPass], only when a pass is about to return
+     * [FlushResult.Retryable] — never from [enqueue]. A working transport
+     * therefore never touches this: the monitor exists purely to resume a
+     * BACKLOGGED drain on reconnect, so it has nothing to do until a pass
+     * has actually failed retryably. Idempotent (a monitor already running
+     * for this backlog episode is left alone) and a no-op on a context-less
+     * client (unit tests) since there is no reconnect trigger there.
+     */
     private fun startOutboxReconnectMonitorIfNeeded() {
         val context = androidContext ?: return
         val m = synchronized(lock) {
             if (outboxReconnectMonitor != null || outbox.isEmpty) return
-            NetworkMonitor(context).also { outboxReconnectMonitor = it }
+            networkMonitorFactory(context).also { outboxReconnectMonitor = it }
         }
         // Registering while already online fires immediately — one bounded
         // extra flush attempt, coalesced by requestFlush. (Registered outside

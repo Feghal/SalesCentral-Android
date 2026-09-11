@@ -282,7 +282,12 @@ Underlying client (`SalesCentral.shared.…`) — same table as the
 `spendCredits(amount, reason, idempotencyKey)`, `claimReward()`,
 `recordSession(start, end, durationSec)`, `track` / `trackBatch`,
 `flush()`, `clearUser()`. Semantics (idempotency, 401 handling, cache
-refresh cadence, error codes) mirror iOS exactly.
+refresh cadence, error codes) mirror iOS — with one deliberate delivery-
+timing difference: `track` / `trackBatch` / `recordSession` never send
+directly here, even with a live connection and a valid token. iOS still
+sends immediately when its queue is empty; Android always enqueues and
+returns, and only the SDK's own drain coroutine ever performs the send. See
+"Analytics outbox" below.
 
 ### Analytics outbox
 
@@ -298,7 +303,12 @@ errors / 5xx / 401, permanent 4xx dropped with a warning. `SalesCentral
 .shared.flush()` awaits a drain and returns a `FlushResult` when you need
 the delivery outcome (tests, a "sync now" button). The queue is memory-only:
 items are lost if the process is killed before they flush, and
-`clearUser()` empties it.
+`clearUser()` empties it — including anything tracked moments earlier that
+hasn't sent yet. **`await flush()` before calling `clearUser()`** whenever a
+final event matters (e.g. a `sign_out`-style event on logout); otherwise it
+is silently dropped. `clearUser()` logs a `SalesLog` warning naming how many
+queued items it discarded, so a non-zero drop is at least visible in logcat
+even when that call was skipped.
 
 ## Push notifications
 
@@ -350,7 +360,7 @@ for tests via `SalesConfig(tokenStore = InMemoryTokenStore())` +
 
 ```bash
 cd sdk/android
-./gradlew :salescentral:testDebugUnitTest   # JVM unit tests (38)
+./gradlew :salescentral:testDebugUnitTest   # JVM unit tests (71)
 ./gradlew :salescentral:assembleRelease     # AAR
 ```
 
