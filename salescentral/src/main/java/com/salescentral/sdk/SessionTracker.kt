@@ -11,9 +11,9 @@ import kotlinx.coroutines.launch
 import java.time.Instant
 
 /**
- * Foreground-time tracker. Listens to the process lifecycle and posts a
- * finished session to the server every time the app moves to the
- * background.
+ * Foreground-time tracker. Listens to the process lifecycle and records a
+ * finished session every time the app moves to the background — into the
+ * client's analytics outbox, which delivers it (see [SalesClient.recordSession]).
  *
  * `ON_STOP` fires only on TRUE backgrounding — configuration changes and
  * transient interruptions (permission dialogs, notification shade) don't
@@ -102,12 +102,8 @@ class SessionTracker(private val client: SalesClient) {
         startedAt = null
         val end = Instant.now()
         val duration = maxOf(0, (end.epochSecond - start.epochSecond).toInt())
-        scope.launch {
-            try {
-                client.recordSession(start, end, duration)
-            } catch (e: Exception) {
-                SalesLog.debug(SalesLog.Category.SESSION, "recordSession failed: ${e.message}")
-            }
-        }
+        // Enqueue-only (no network on this lifecycle callback); the outbox
+        // drain delivers it, or retries after a reconnect / next launch's user.
+        client.recordSession(start, end, duration)
     }
 }

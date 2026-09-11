@@ -33,6 +33,7 @@ object SalesLog {
         PAYWALL("paywall"),   // paywall lookup + filtering
         SESSION("session"),   // foreground session tracker
         OBSERVER("observer"), // background purchase observer
+        OUTBOX("outbox"),     // pre-user / offline analytics queue
     }
 
     fun debug(cat: Category, message: String) {

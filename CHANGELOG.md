@@ -4,6 +4,52 @@ All notable changes to the SalesCentral Android SDK are tracked here. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [semver](https://semver.org).
 
+## [1.2.0] - 2026-09-11
+
+Analytics parity with the Swift SDK's outbox (1.3.1+). Every existing call
+site keeps compiling; see "Changed" for the two signature changes.
+
+### Added
+- **Analytics outbox** (`Outbox.kt`, port of `Outbox.swift`): `track` /
+  `trackBatch` / `recordSession` now queue into an in-memory FIFO (cap 500,
+  oldest dropped) and the SDK's own drain coroutine delivers it — after the
+  user is established (`ensureUser` / `restorePurchases`), on network
+  reconnect (`NetworkMonitor`), and on every enqueue (coalesced into a
+  single in-flight pass). Sends are token-checked (no doomed 401
+  round-trips), batched at 50 events per request, and a batch is only let
+  go once the server acknowledges it: network errors, 5xx and 401 re-queue
+  it at the FRONT (order preserved), validation-class 4xx drop it with a
+  `SalesLog` warning. Known limitations, same as iOS: memory-only (lost on
+  process kill), no idempotency key (a lost 2xx can duplicate a batch on
+  retry), and `clearUser()` empties the queue.
+- `occurredAt` on events: `SalesClient.track(name, properties, occurredAt =
+  now)` and `SalesEvent.occurredAt` (defaults to construction time) put the
+  ENQUEUE time on the wire, so a late flush no longer skews timelines.
+  Previously `track` stamped `Instant.now()` at send time and `trackBatch`
+  stamped one `now` for the whole batch.
+- `SalesClient.flush(): FlushResult` — awaits one drain pass and reports
+  `Delivered(count)` / `Retryable(reason)` / `Permanent(reason)` /
+  `NothingToSend`. Production code never needs it (the SDK flushes on its
+  own); it exists so a caller or a test can await delivery.
+- `SalesClient.pendingAnalyticsCount`, `SalesLog.Category.OUTBOX`.
+- `SalesClient` constructor gained `clock: Clock` and `outboxScope:
+  CoroutineScope` (both defaulted) for tests.
+
+### Changed
+- `SalesClient.track` / `trackBatch` / `recordSession` and
+  `SalesStore.track` are **no longer `suspend`** and return immediately —
+  an app-side call never blocks on the 15s/30s HTTP timeouts again.
+  Source-compatible for the usual call sites (calling a plain function from
+  a coroutine is fine; `SessionTracker` and `SalesStore` were updated); a
+  caller that passed `::track` as a `suspend` function reference needs a
+  lambda. `recordSession` no longer throws: retryable failures queue,
+  permanent ones are logged and dropped.
+- `track` used to POST the single-event wire shape (`{name, properties,
+  occurredAt}`); everything now goes out as the batch shape
+  (`{events: [...]}`), which the events endpoint has always accepted.
+- Failed sends are no longer silently swallowed (`catch (_: Exception) {}`
+  is gone): they are re-queued or logged, and `flush()` reports them.
+
 ## [1.1.0] - 2026-09-11
 
 Toolchain release — **no public API change**. `SalesCentral`, `SalesClient`,

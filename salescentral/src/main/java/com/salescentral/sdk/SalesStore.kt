@@ -211,8 +211,18 @@ class SalesStore(val client: SalesClient) {
         }
     }
 
-    suspend fun track(name: String, properties: Map<String, Any?> = emptyMap()) {
-        client.track(name, properties)
+    /**
+     * Log a custom event. Enqueue-only, never blocks or throws — see
+     * [SalesClient.track]. Safe to call before [bootstrap] has established a
+     * user: the SDK's outbox holds the event (with [occurredAt], stamped at
+     * this call by default) and delivers it once a user token exists.
+     */
+    fun track(
+        name: String,
+        properties: Map<String, Any?> = emptyMap(),
+        occurredAt: Instant = Instant.now(),
+    ) {
+        client.track(name, properties, occurredAt)
     }
 
     // ------------------------------------------------------------------

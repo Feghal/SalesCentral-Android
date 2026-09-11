@@ -1,21 +1,32 @@
 package com.salescentral.sdk
 
 import android.content.Context
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
 import java.security.MessageDigest
+import java.time.Clock
 import java.time.Instant
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * The single entry point for talking to the SalesCentral backend.
  *
- * All methods are `suspend` — call them from any coroutine. The client owns
- * the user JWT (read/written through the configured [TokenStore]) and
+ * Every network-bound method is `suspend` — call them from any coroutine.
+ * The analytics calls ([track], [trackBatch], [recordSession]) are the
+ * exception: they are plain functions that only queue into the in-memory
+ * analytics outbox and return immediately; the SDK's own drain coroutine
+ * performs the sends (see "Analytics outbox" below). The client owns the
+ * user JWT (read/written through the configured [TokenStore]) and
  * transparently re-issues it on calls that return one.
  *
  * Typical lifecycle:
@@ -35,6 +46,16 @@ class SalesClient(
     private val transport: HttpTransport = UrlConnectionTransport(),
     private val attestService: DeviceAttestService = UnsupportedAttestService(),
     internal val androidContext: Context? = null,
+    /**
+     * Source of `occurredAt` for [track]. Injected so tests can prove an
+     * event carries its ENQUEUE time, not its send time.
+     */
+    private val clock: Clock = Clock.systemUTC(),
+    /**
+     * Scope the analytics drain coroutine runs on. Defaults to the SDK's own
+     * background scope; tests pass a scope driven by their test scheduler.
+     */
+    private val outboxScope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
 ) {
 
     private val tokenStore: TokenStore = config.tokenStore
@@ -213,6 +234,10 @@ class SalesClient(
         val user = resp.optJSONObject("user")?.let { SalesUser.fromJson(it) }
             ?: throw SalesError.Decoding("bundle response: missing 'user'")
         if (token.isNotEmpty()) tokenStore.write(token)
+        // A user now exists: anything queued before it (app_launch fired
+        // ahead of bootstrap, an offline stretch) can go. Fire and forget so
+        // bootstrap latency isn't extended by the flush.
+        if (!outbox.isEmpty) requestFlush()
         synchronized(lock) {
             _currentUser = user
             _configuredProducts = resp.optJSONArray("products")?.let { arr ->
@@ -337,6 +362,7 @@ class SalesClient(
         )
         val resp = RestoreResult.fromJson(respJson)
         tokenStore.write(resp.token)
+        if (!outbox.isEmpty) requestFlush()
         synchronized(lock) {
             _currentUser = resp.user
             resp.products?.let { _configuredProducts = it }
@@ -355,7 +381,8 @@ class SalesClient(
      * Also wipes the stable `clientId`, so the next [ensureUser] creates a
      * genuinely NEW guest user instead of de-duplicating back to this one —
      * a real identity reset (useful for testing). Also clears the in-flight
-     * transaction-claim set.
+     * transaction-claim set and empties the analytics outbox (queued events
+     * belonged to the identity being discarded).
      */
     fun clearUser() {
         tokenStore.clear()
@@ -368,6 +395,8 @@ class SalesClient(
             _remoteConfigCache = emptyMap()
             _experimentAssignments = emptyMap()
         }
+        outbox.removeAll()
+        stopOutboxReconnectMonitorIfDrained()
     }
 
     // ------------------------------------------------------------------
@@ -561,68 +590,316 @@ class SalesClient(
     }
 
     // ------------------------------------------------------------------
-    // Engagement
+    // Engagement — analytics outbox
     // ------------------------------------------------------------------
+
+    /**
+     * See [Outbox]. Every analytics call below only APPENDS here and returns;
+     * the drain coroutine on [outboxScope] performs all sends. Port of the
+     * Swift SDK's outbox (1.3.1+) with one deliberate difference: on iOS a
+     * call still sends directly when nothing is queued, here NOTHING ever
+     * touches the network on the caller's path.
+     */
+    private val outbox = Outbox()
+
+    /** Serialises flush passes so exactly one drain is ever in flight. */
+    private val flushMutex = Mutex()
+
+    /**
+     * Coalesced "a flush was requested" flag. Many enqueues while a pass is
+     * running collapse into one extra pass after it — never one per item.
+     */
+    private val flushRequested = AtomicBoolean(false)
+
+    /** Single-flight latch for the drainer coroutine spawned by [requestFlush]. */
+    private val drainerRunning = AtomicBoolean(false)
+
+    /**
+     * Watches connectivity while the outbox is non-empty (a fresh instance
+     * per backlog; stopped once drained). Null on a context-less client
+     * (unit tests) — there is no reconnect trigger there.
+     */
+    private var outboxReconnectMonitor: NetworkMonitor? = null
+
+    /** Number of analytics items queued and not yet acknowledged by the server. */
+    val pendingAnalyticsCount: Int get() = outbox.count
 
     /**
      * Record a finished foreground session. The SDK's [SessionTracker]
      * calls this for you on app lifecycle events.
+     *
+     * Enqueue-only: the session is queued in the in-memory outbox with the
+     * timestamps you pass and sent by the SDK's drain coroutine once a user
+     * token exists and the network cooperates. Never throws, never blocks.
      */
-    suspend fun recordSession(start: Instant, end: Instant, durationSec: Int? = null) {
-        val body = JSONObject().apply {
-            put("startedAt", JsonUtil.formatDate(start))
-            put("endedAt", JsonUtil.formatDate(end))
-            durationSec?.let { put("durationSec", it) }
-        }
-        request(SalesConfig.Endpoint.RECORD_SESSION, method = "POST", body = body, attachUserToken = true)
+    fun recordSession(start: Instant, end: Instant, durationSec: Int? = null) {
+        enqueue(listOf(OutboxItem.Session(start, end, durationSec)))
     }
 
     /**
-     * Log a single custom event. Failures are swallowed silently — events
-     * are analytics-grade signals, not application state, so they should
-     * never break the caller.
+     * Log a single custom event. Never throws, never blocks: the event is
+     * appended to the in-memory outbox (cap 500, oldest dropped on overflow)
+     * stamped with [occurredAt] — by default the moment of THIS call, not the
+     * moment it is eventually sent — and the SDK's drain coroutine delivers
+     * it once a user token exists and the network cooperates. Permanent
+     * rejections are dropped with a warning. Await [flush] if you need to
+     * know the delivery outcome.
      *
      * Property values may be String / Number / Boolean / List / Map.
      */
-    suspend fun track(name: String, properties: Map<String, Any?> = emptyMap()) {
-        val body = JSONObject().apply {
-            put("name", name)
-            put("properties", JsonUtil.toJsonValue(properties))
-            put("occurredAt", JsonUtil.formatDate(Instant.now()))
+    fun track(
+        name: String,
+        properties: Map<String, Any?> = emptyMap(),
+        occurredAt: Instant = Instant.now(clock),
+    ) {
+        enqueue(listOf(OutboxItem.Event(name, properties, occurredAt)))
+    }
+
+    /**
+     * One analytics event for [trackBatch]. [occurredAt] defaults to the
+     * moment the value is constructed, so buffering a batch app-side before
+     * calling [trackBatch] does not skew timestamps.
+     */
+    data class SalesEvent(
+        val name: String,
+        val properties: Map<String, Any?> = emptyMap(),
+        val occurredAt: Instant = Instant.now(),
+    )
+
+    /**
+     * Log multiple events at once. Same queueing behaviour as [track]; each
+     * event keeps its own [SalesEvent.occurredAt]. Any number of events —
+     * the outbox chunks them at 50 per request on the wire (the server's
+     * MAX_BATCH), so nothing is truncated.
+     */
+    fun trackBatch(events: List<SalesEvent>) {
+        if (events.isEmpty()) return
+        enqueue(events.map { OutboxItem.Event(it.name, it.properties, it.occurredAt) })
+    }
+
+    /**
+     * Drain the outbox now and report what happened. The SDK flushes on its
+     * own — after a user is established, on network reconnect, and on every
+     * enqueue — so production code never needs this; it exists so a caller
+     * (or a test) can AWAIT delivery. Serialised with the automatic drain:
+     * when this returns, every item queued before the call has been either
+     * acknowledged by the server, dropped as permanently rejected, or is
+     * still queued behind the retryable failure the result names.
+     */
+    suspend fun flush(): FlushResult = flushMutex.withLock { drainPass() }
+
+    private fun enqueue(items: List<OutboxItem>) {
+        val dropped = outbox.append(items)
+        if (dropped > 0) {
+            SalesLog.warn(SalesLog.Category.OUTBOX, "outbox over cap — dropped $dropped oldest item(s)")
         }
-        try {
-            request(SalesConfig.Endpoint.RECORD_EVENT, method = "POST", body = body, attachUserToken = true)
-        } catch (_: Exception) {
+        SalesLog.info(SalesLog.Category.OUTBOX, "queued ${describe(items)} — ${outbox.count} pending")
+        startOutboxReconnectMonitorIfNeeded()
+        requestFlush()
+    }
+
+    /**
+     * Ask the drainer to run a pass. Cheap and thread-safe: sets the
+     * coalescing flag and spawns the drainer coroutine only if none is
+     * running; a running one loops again after its current pass.
+     */
+    private fun requestFlush() {
+        flushRequested.set(true)
+        launchDrainerIfIdle()
+    }
+
+    private fun launchDrainerIfIdle() {
+        if (!drainerRunning.compareAndSet(false, true)) return
+        outboxScope.launch {
+            try {
+                while (flushRequested.getAndSet(false)) {
+                    try {
+                        flush()
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (t: Throwable) {
+                        // Analytics must never take the process down.
+                        SalesLog.error(SalesLog.Category.OUTBOX, "flush pass crashed: $t")
+                    }
+                }
+            } finally {
+                drainerRunning.set(false)
+            }
+            // A request that landed between the loop's last getAndSet(false)
+            // and drainerRunning.set(false) would otherwise be stranded.
+            if (flushRequested.get()) launchDrainerIfIdle()
         }
     }
 
-    /** One buffered analytics event for [trackBatch]. */
-    data class SalesEvent(val name: String, val properties: Map<String, Any?> = emptyMap())
+    /**
+     * One FIFO pass. Must be called with [flushMutex] held. Stops early on a
+     * retryable failure (the failed batch requeues at the FRONT, so order is
+     * preserved ahead of anything appended meanwhile) or when no user token
+     * exists yet — no doomed 401 round-trips.
+     */
+    private suspend fun drainPass(): FlushResult {
+        if (outbox.isEmpty) return FlushResult.NothingToSend
+        if (tokenStore.read() == null) {
+            SalesLog.debug(SalesLog.Category.OUTBOX, "flush skipped — no user token yet (${outbox.count} pending)")
+            return FlushResult.Retryable("no user token yet")
+        }
+        SalesLog.info(SalesLog.Category.OUTBOX, "flushing ${outbox.count} queued item(s)")
+        var delivered = 0
+        var lastPermanent: String? = null
+        while (true) {
+            // Items are REMOVED from the queue while their request is in
+            // flight and put back at the front if it fails retryably — the
+            // server's 2xx is the only thing that ever lets them go for good
+            // (ack-before-remove for everything short of a process kill).
+            val batch = outbox.drainNext() ?: break
+            try {
+                sendBatch(batch)
+                delivered += batch.items.size
+                SalesLog.info(
+                    SalesLog.Category.OUTBOX,
+                    "delivered ${describe(batch.items)} — ${outbox.count} remaining",
+                )
+            } catch (e: CancellationException) {
+                outbox.requeue(batch)
+                throw e
+            } catch (e: Exception) {
+                val reason = e.message ?: e.javaClass.simpleName
+                if (isRetryableForOutbox(e)) {
+                    // Known narrow race (same as iOS): clearUser() during this
+                    // await wipes the outbox, and this requeue can resurrect
+                    // the abandoned identity's batch. Distinguishing that from
+                    // a mid-flight 401 token-clear (whose items MUST stay
+                    // queued) needs an identity generation counter — accepted
+                    // for analytics-grade data.
+                    val dropped = outbox.requeue(batch)
+                    if (dropped > 0) {
+                        SalesLog.warn(
+                            SalesLog.Category.OUTBOX,
+                            "outbox over cap during requeue — dropped $dropped oldest item(s)",
+                        )
+                    }
+                    SalesLog.warn(
+                        SalesLog.Category.OUTBOX,
+                        "flush stopped — retryable failure, ${outbox.count} item(s) kept: $reason",
+                    )
+                    return FlushResult.Retryable(reason)
+                }
+                lastPermanent = reason
+                SalesLog.warn(
+                    SalesLog.Category.OUTBOX,
+                    "dropped ${batch.items.size} item(s) — permanent rejection: $reason",
+                )
+            }
+        }
+        stopOutboxReconnectMonitorIfDrained()
+        return when {
+            delivered > 0 || lastPermanent == null -> FlushResult.Delivered(delivered)
+            else -> FlushResult.Permanent(lastPermanent)
+        }
+    }
 
     /**
-     * Log multiple events at once. Useful when you've buffered events
-     * while offline. Max 50 events per call, 16KB per event's properties.
+     * Errors worth retrying later: transport failures, server errors, and
+     * auth losses that a future ensureUser() repairs (the 401 handling in
+     * [request] has already wiped the token, so the next pass waits for a
+     * new one instead of looping). Everything else (validation-class 4xx)
+     * is permanent — retrying can never succeed.
      */
-    suspend fun trackBatch(events: List<SalesEvent>) {
-        val now = JsonUtil.formatDate(Instant.now())
-        val body = JSONObject().put(
-            "events",
-            JSONArray().apply {
-                for (e in events) {
-                    put(
-                        JSONObject().apply {
-                            put("name", e.name)
-                            put("properties", JsonUtil.toJsonValue(e.properties))
-                            put("occurredAt", now)
-                        },
-                    )
-                }
-            },
-        )
+    private fun isRetryableForOutbox(e: Exception): Boolean = when (e) {
+        is SalesError.Network -> true
+        is SalesError.Http -> e.status >= 500 || e.status == 401
+        else -> false
+    }
+
+    /**
+     * Send one drained unit. A 2xx whose body fails to decode is SUCCESS
+     * for queue purposes — the server recorded it; never retry it.
+     */
+    private suspend fun sendBatch(batch: OutboxBatch) {
         try {
-            request(SalesConfig.Endpoint.RECORD_EVENT, method = "POST", body = body, attachUserToken = true)
-        } catch (_: Exception) {
+            when (batch) {
+                is OutboxBatch.Events -> request(
+                    SalesConfig.Endpoint.RECORD_EVENT,
+                    method = "POST",
+                    body = eventsBody(batch.events),
+                    attachUserToken = true,
+                )
+                is OutboxBatch.Session -> request(
+                    SalesConfig.Endpoint.RECORD_SESSION,
+                    method = "POST",
+                    body = sessionBody(batch.session),
+                    attachUserToken = true,
+                )
+            }
+        } catch (e: SalesError.Decoding) {
+            SalesLog.warn(SalesLog.Category.OUTBOX, "2xx response failed to decode (${e.message}) — treating as sent")
         }
+    }
+
+    /**
+     * Wire shape shared by single and multi-event sends — the events
+     * endpoint accepts the batch form for one event too, and each element
+     * carries its own `occurredAt` (`eventController.js`: `{ name,
+     * properties?, occurredAt? }` per event).
+     */
+    private fun eventsBody(events: List<OutboxItem.Event>): JSONObject = JSONObject().put(
+        "events",
+        JSONArray().apply {
+            for (e in events) {
+                put(
+                    JSONObject().apply {
+                        put("name", e.name)
+                        put("properties", JsonUtil.toJsonValue(e.properties))
+                        put("occurredAt", JsonUtil.formatDate(e.occurredAt))
+                    },
+                )
+            }
+        },
+    )
+
+    private fun sessionBody(session: OutboxItem.Session): JSONObject = JSONObject().apply {
+        put("startedAt", JsonUtil.formatDate(session.start))
+        put("endedAt", JsonUtil.formatDate(session.end))
+        session.durationSec?.let { put("durationSec", it) }
+    }
+
+    private fun describe(items: List<OutboxItem>): String {
+        val first = items.firstOrNull() ?: return "0 item(s)"
+        val head = when (first) {
+            is OutboxItem.Event -> "event '${first.name}' occurredAt=${JsonUtil.formatDate(first.occurredAt)}"
+            is OutboxItem.Session ->
+                "session ${JsonUtil.formatDate(first.start)}→${JsonUtil.formatDate(first.end)}"
+        }
+        return if (items.size == 1) head else "${items.size} item(s) starting with $head"
+    }
+
+    private fun startOutboxReconnectMonitorIfNeeded() {
+        val context = androidContext ?: return
+        val m = synchronized(lock) {
+            if (outboxReconnectMonitor != null || outbox.isEmpty) return
+            NetworkMonitor(context).also { outboxReconnectMonitor = it }
+        }
+        // Registering while already online fires immediately — one bounded
+        // extra flush attempt, coalesced by requestFlush. (Registered outside
+        // `lock`: it is a binder call.)
+        m.onReconnect = { requestFlush() }
+        m.start()
+        SalesLog.debug(SalesLog.Category.OUTBOX, "reconnect monitor started")
+    }
+
+    private fun stopOutboxReconnectMonitorIfDrained() {
+        val m = synchronized(lock) {
+            if (!outbox.isEmpty) return
+            outboxReconnectMonitor?.also { outboxReconnectMonitor = null }
+        } ?: return
+        m.stop()
+        SalesLog.debug(SalesLog.Category.OUTBOX, "reconnect monitor stopped — outbox drained")
+    }
+
+    /** Facade teardown hook ([SalesCentral.reset]): release the connectivity callback. */
+    internal fun shutdownOutbox() {
+        val m = synchronized(lock) { outboxReconnectMonitor?.also { outboxReconnectMonitor = null } }
+        m?.stop()
     }
 
     // ==================================================================

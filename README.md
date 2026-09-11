@@ -72,7 +72,7 @@ dependencyResolutionManagement {
 
 // app/build.gradle.kts
 dependencies {
-    implementation("com.github.Feghal:SalesCentral-Android:1.1.0")
+    implementation("com.github.Feghal:SalesCentral-Android:1.2.0")
 }
 ```
 
@@ -281,8 +281,24 @@ Underlying client (`SalesCentral.shared.…`) — same table as the
 `configuredProducts` / `effects(productId)`, `currentSubscription()`,
 `spendCredits(amount, reason, idempotencyKey)`, `claimReward()`,
 `recordSession(start, end, durationSec)`, `track` / `trackBatch`,
-`clearUser()`. Semantics (idempotency, 401 handling, cache refresh
-cadence, error codes) mirror iOS exactly.
+`flush()`, `clearUser()`. Semantics (idempotency, 401 handling, cache
+refresh cadence, error codes) mirror iOS exactly.
+
+### Analytics outbox
+
+Events and sessions fired before the user exists (or while offline) queue
+in memory (cap 500, oldest dropped) and flush automatically with their
+original timestamps — after the user is established, on network reconnect,
+and on the next analytics call. `track` / `trackBatch` / `recordSession`
+are plain (non-suspending) functions that only enqueue: nothing touches the
+network on the caller's path, `occurredAt` is stamped at the call (pass
+your own to backdate), and the SDK's drain coroutine sends in FIFO order —
+50 events per request, a failed batch re-queued at the front on network
+errors / 5xx / 401, permanent 4xx dropped with a warning. `SalesCentral
+.shared.flush()` awaits a drain and returns a `FlushResult` when you need
+the delivery outcome (tests, a "sync now" button). The queue is memory-only:
+items are lost if the process is killed before they flush, and
+`clearUser()` empties it.
 
 ## Push notifications
 

@@ -201,6 +201,7 @@ object SalesCentral {
             _productsTask = null
             _reconnectMonitor?.stop()
             _reconnectMonitor = null
+            _client?.shutdownOutbox()
             _client = null
             _store = null
             _billing = null

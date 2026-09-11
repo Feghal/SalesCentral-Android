@@ -470,57 +470,76 @@ class SalesClientTest {
     }
 
     // ------------------------------------------------------------------
-    // Events
+    // Events (SDK 1.2.0: enqueue-only — delivery is awaited via flush();
+    // the outbox semantics themselves are covered in SalesClientOutboxTest)
     // ------------------------------------------------------------------
 
     @Test
-    fun `track swallows failures and sends name properties occurredAt`() = runTest {
+    fun `track enqueues and flush sends name properties occurredAt in the batch form`() = runTest {
         val transport = FakeTransport()
-        val client = TestFixtures.client(transport)
+        val client = TestFixtures.client(transport, outboxScope = TestFixtures.parkedScope())
         transport.enqueue(200, TestFixtures.bundleJson())
         client.ensureUser()
 
-        transport.enqueue(500, """{ "error": "server_error" }""")
         client.track("level_completed", mapOf("score" to 8420, "won" to true))
+        // Enqueue-only: the caller's path never touched the transport.
+        assertEquals(1, transport.requests.size)
+        assertEquals(1, client.pendingAnalyticsCount)
 
-        val body = JSONObject(transport.requests.last().body!!)
+        // A 5xx keeps the event queued (it used to be swallowed and lost).
+        transport.enqueue(500, """{ "error": "server_error" }""")
+        assertEquals(FlushResult.Retryable("HTTP 500 server_error"), client.flush())
+        assertEquals(1, client.pendingAnalyticsCount)
+
+        transport.enqueue(200, """{ "ok": true }""")
+        assertEquals(FlushResult.Delivered(1), client.flush())
+        assertEquals(0, client.pendingAnalyticsCount)
+        val events = JSONObject(transport.requests.last().body!!).getJSONArray("events")
+        assertEquals(1, events.length())
+        val body = events.getJSONObject(0)
         assertEquals("level_completed", body.getString("name"))
         assertEquals(8420, body.getJSONObject("properties").getInt("score"))
         assertNotNull(JsonUtil.parseDate(body.getString("occurredAt")))
+        assertEquals("jwt-1", transport.requests.last().headers["x-user-token"])
     }
 
     @Test
     fun `trackBatch wraps events in an events array`() = runTest {
         val transport = FakeTransport()
-        val client = TestFixtures.client(transport)
+        val client = TestFixtures.client(transport, outboxScope = TestFixtures.parkedScope())
         transport.enqueue(200, TestFixtures.bundleJson())
         client.ensureUser()
 
-        transport.enqueue(200, """{ "ok": true }""")
         client.trackBatch(
             listOf(
                 SalesClient.SalesEvent("a"),
                 SalesClient.SalesEvent("b", mapOf("k" to "v")),
             ),
         )
+        transport.enqueue(200, """{ "ok": true }""")
+        assertEquals(FlushResult.Delivered(2), client.flush())
         val events = JSONObject(transport.requests.last().body!!).getJSONArray("events")
         assertEquals(2, events.length())
         assertEquals("b", events.getJSONObject(1).getString("name"))
+        assertEquals("v", events.getJSONObject(1).getJSONObject("properties").getString("k"))
     }
 
     @Test
     fun `recordSession posts start end and duration`() = runTest {
         val transport = FakeTransport()
-        val client = TestFixtures.client(transport)
+        val client = TestFixtures.client(transport, outboxScope = TestFixtures.parkedScope())
         transport.enqueue(200, TestFixtures.bundleJson())
         client.ensureUser()
 
-        transport.enqueue(200, """{ "ok": true }""")
         val start = java.time.Instant.parse("2026-07-09T10:00:00Z")
         val end = java.time.Instant.parse("2026-07-09T10:05:00Z")
         client.recordSession(start, end, durationSec = 300)
+        transport.enqueue(200, """{ "ok": true }""")
+        assertEquals(FlushResult.Delivered(1), client.flush())
 
-        val body = JSONObject(transport.requests.last().body!!)
+        val req = transport.requests.last()
+        assertTrue(req.url.endsWith("/ffffffffffff"))
+        val body = JSONObject(req.body!!)
         assertEquals("2026-07-09T10:00:00Z", body.getString("startedAt"))
         assertEquals("2026-07-09T10:05:00Z", body.getString("endedAt"))
         assertEquals(300, body.getInt("durationSec"))
