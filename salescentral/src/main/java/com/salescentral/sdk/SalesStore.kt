@@ -82,14 +82,20 @@ class SalesStore(val client: SalesClient) {
             _user.value = if (context != null) client.ensureUser(context) else client.ensureUser()
             _products.value = client.configuredProducts
             _retention.value = client.retentionStatus
-            _subscription.value = try {
-                client.currentSubscription()
-            } catch (_: Exception) {
-                null
+            if (client.analyticsOnly) {
+                // Server says this platform is analytics-only: no subscription
+                // fetch, no foreground re-sync. Sessions still track.
+                SalesLog.info(SalesLog.Category.SDK, "bootstrap — analyticsOnly (server): skipping subscription fetch + foreground refresh")
+            } else {
+                _subscription.value = try {
+                    client.currentSubscription()
+                } catch (_: Exception) {
+                    null
+                }
+                // Re-sync subscription/premium from the server whenever the app
+                // returns to the foreground (catches renewals / refunds on resume).
+                sessionTracker.onForeground = { refreshSubscription() }
             }
-            // Re-sync subscription/premium from the server whenever the app
-            // returns to the foreground (catches renewals / refunds on resume).
-            sessionTracker.onForeground = { refreshSubscription() }
             sessionTracker.start()
         } catch (e: SalesError) {
             _lastError.value = e
@@ -115,6 +121,7 @@ class SalesStore(val client: SalesClient) {
 
     suspend fun restorePurchases() {
         try {
+            if (client.analyticsOnly) throw SalesError.InvalidState("analytics_only")
             val r = client.restorePurchases()
             _user.value = r.user
             _products.value = client.configuredProducts
@@ -143,6 +150,7 @@ class SalesStore(val client: SalesClient) {
      * like renewals / refunds, not for catching plain time-based expiry.
      */
     suspend fun refreshSubscription() {
+        if (client.analyticsOnly) return
         val sub = try {
             client.currentSubscription()
         } catch (_: Exception) {

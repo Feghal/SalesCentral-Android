@@ -120,6 +120,10 @@ object SalesCentral {
             _bootstrapped = true
             _reconnectMonitor?.stop()
             _reconnectMonitor = null
+            if (shared.analyticsOnly) {
+                SalesLog.info(SalesLog.Category.SDK, "start() — bootstrap complete (analyticsOnly from server: skipping Play observer + product prefetch)")
+                return
+            }
             SalesLog.info(SalesLog.Category.SDK, "start() — bootstrap complete; starting observer + product prefetch")
             // Watch for out-of-band purchases (renewals, pending purchases
             // resolving, unacknowledged purchases from a previous run).
@@ -237,6 +241,14 @@ object SalesCentral {
     /** Has the SDK been configured (via [start] or [configure])? */
     val isConfigured: Boolean get() = _client != null
 
+    /** Throw when a transaction API is invoked on the facade while the server reports analyticsOnly. */
+    private fun guardTransactionsAllowed(operation: String) {
+        if (shared.analyticsOnly) {
+            SalesLog.warn(SalesLog.Category.SDK, "$operation blocked — server reports analyticsOnly for this platform")
+            throw SalesError.InvalidState("analytics_only")
+        }
+    }
+
     // ------------------------------------------------------------------
     // Logging
     // ------------------------------------------------------------------
@@ -276,7 +288,7 @@ object SalesCentral {
      * just added a new product).
      */
     suspend fun loadProducts(): List<ProductDetails> {
-        shared // throws a descriptive error when unconfigured
+        guardTransactionsAllowed("loadProducts") // also throws a descriptive error when unconfigured (via shared)
         val task = synchronized(configLock) {
             _productsTask ?: run {
                 SalesLog.debug(SalesLog.Category.STORE, "loadProducts() — no prefetch in flight, fetching on demand")
@@ -299,7 +311,7 @@ object SalesCentral {
      * Otherwise [start] does this once per launch.
      */
     suspend fun reloadProducts(): List<ProductDetails> {
-        shared
+        guardTransactionsAllowed("reloadProducts")
         SalesLog.info(SalesLog.Category.STORE, "reloadProducts() — refetching SKUs + Play lookup")
         val task = scope.async { fetchProductsFromPlay(forceRefreshIds = true) }
         synchronized(configLock) { _productsTask = task }
@@ -368,6 +380,7 @@ object SalesCentral {
         product: ProductDetails,
         offerToken: String? = null,
     ): PurchaseResult {
+        guardTransactionsAllowed("purchase")
         val billing = _billing ?: throw IllegalStateException(
             "SalesCentral is not configured — call SalesCentral.start(context) first.",
         )
