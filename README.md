@@ -72,7 +72,7 @@ dependencyResolutionManagement {
 
 // app/build.gradle.kts
 dependencies {
-    implementation("com.github.Feghal:SalesCentral-Android:1.2.0")
+    implementation("com.github.Feghal:SalesCentral-Android:1.2.1")
 }
 ```
 
@@ -222,6 +222,10 @@ SalesCentral.shared.setUserProperties(mapOf(
 ))
 SalesCentral.shared.track("level_completed", mapOf("score" to 8420))
 
+// Registered ("super") event properties: merged into every event tracked
+// from now on (per-call keys win). Re-register each launch — in-memory.
+SalesCentral.shared.setEventProperties(mapOf("plan" to "premium"))
+
 // Server-defined paywall + remote-config (variants applied automatically)
 val paywall = SalesCentral.shared.paywall(key = "main_paywall")
 val products = paywall.loadProducts()   // List<ProductDetails> in admin order
@@ -281,7 +285,8 @@ Underlying client (`SalesCentral.shared.…`) — same table as the
 `configuredProducts` / `effects(productId)`, `currentSubscription()`,
 `spendCredits(amount, reason, idempotencyKey)`, `claimReward()`,
 `recordSession(start, end, durationSec)`, `track` / `trackBatch`,
-`flush()`, `clearUser()`. Semantics (idempotency, 401 handling, cache
+`setEventProperties` / `setEventProperty` / `removeEventProperty` /
+`clearEventProperties`, `flush()`, `clearUser()`. Semantics (idempotency, 401 handling, cache
 refresh cadence, error codes) mirror iOS — with one deliberate delivery-
 timing difference: `track` / `trackBatch` / `recordSession` never send
 directly here, even with a live connection and a valid token. iOS still
@@ -309,6 +314,17 @@ final event matters (e.g. a `sign_out`-style event on logout); otherwise it
 is silently dropped. `clearUser()` logs a `SalesLog` warning naming how many
 queued items it discarded, so a non-zero drop is at least visible in logcat
 even when that call was skipped.
+
+**Registered ("super") event properties.** `setEventProperties(mapOf(...))`
+(plus `setEventProperty` / `removeEventProperty` / `clearEventProperties`,
+on `SalesCentral.shared` and `SalesCentral.store` alike) registers
+properties the SDK merges into every subsequent `track` / `trackBatch`
+event, so a persistent trait — `"plan" to "premium"`, a cohort — segments
+event analytics without being passed at each call site. Per-call properties
+win on a key collision. The merge happens at enqueue time, so an event
+queued before the user exists carries the values registered when it was
+tracked. In-memory only (re-register each launch) and NOT cleared by
+`clearUser()`. Same API and semantics as the Swift SDK (1.3.2+).
 
 ## Push notifications
 

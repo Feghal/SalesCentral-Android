@@ -76,7 +76,7 @@ afterEvaluate {
                 from(components["release"])
                 groupId = "com.salescentral"
                 artifactId = "salescentral"
-                version = "1.2.0"
+                version = "1.2.1"
             }
         }
     }

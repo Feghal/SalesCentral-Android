@@ -77,6 +77,14 @@ class SalesClient(
     private var _experimentAssignments: Map<String, String> = emptyMap()
     private var _retentionStatus: RetentionStatus? = null
 
+    /**
+     * Registered ("super") event properties — see [setEventProperties].
+     * Deliberately NOT reset by [clearUser]: they are app-level
+     * registrations (re-registered each launch), not user state — same as
+     * the Swift SDK.
+     */
+    private var _superProperties: Map<String, Any?> = emptyMap()
+
     val currentUser: SalesUser? get() = synchronized(lock) { _currentUser }
 
     /**
@@ -648,6 +656,51 @@ class SalesClient(
     /** Number of analytics items queued and not yet acknowledged by the server. */
     val pendingAnalyticsCount: Int get() = outbox.count
 
+    // Registered event ("super") properties -----------------------------
+
+    /**
+     * Merge these into the registered set (existing keys updated, new keys
+     * added). Attached to every event [track] / [trackBatch] queues from now
+     * on, so a persistent trait (`"plan" to "premium"`, say) segments event
+     * analytics without being passed at each call site. Per-call properties
+     * win on a key collision. In-memory only — re-register each launch.
+     *
+     * Values take the same shapes as [track]'s `properties` (String / Number
+     * / Boolean / List / Map, or a [SalesPropertyValue]); a null value rides
+     * as JSON null exactly like a null per-call property — use
+     * [removeEventProperty] to stop attaching a key.
+     */
+    fun setEventProperties(properties: Map<String, Any?>) {
+        if (properties.isEmpty()) return
+        synchronized(lock) { _superProperties = _superProperties + properties }
+    }
+
+    /** Register (or update) a single event property. See [setEventProperties]. */
+    fun setEventProperty(key: String, value: Any?) {
+        synchronized(lock) { _superProperties = _superProperties + (key to value) }
+    }
+
+    /** Stop attaching [key] to future events. */
+    fun removeEventProperty(key: String) {
+        synchronized(lock) { _superProperties = _superProperties - key }
+    }
+
+    /** Drop all registered event properties. */
+    fun clearEventProperties() {
+        synchronized(lock) { _superProperties = emptyMap() }
+    }
+
+    /**
+     * Registered super properties + per-call properties, per-call winning on
+     * a key collision. Snapshotted at enqueue time so the merged set rides
+     * with the event even if it waits in the outbox and flushes later.
+     */
+    private fun mergedEventProperties(perCall: Map<String, Any?>): Map<String, Any?> {
+        val registered = synchronized(lock) { _superProperties }
+        if (registered.isEmpty()) return perCall
+        return registered + perCall
+    }
+
     /**
      * Record a finished foreground session. The SDK's [SessionTracker]
      * calls this for you on app lifecycle events.
@@ -669,14 +722,16 @@ class SalesClient(
      * rejections are dropped with a warning. Await [flush] if you need to
      * know the delivery outcome.
      *
-     * Property values may be String / Number / Boolean / List / Map.
+     * Property values may be String / Number / Boolean / List / Map. Any
+     * registered event properties ([setEventProperties]) are merged in at
+     * this call, [properties] winning on a key collision.
      */
     fun track(
         name: String,
         properties: Map<String, Any?> = emptyMap(),
         occurredAt: Instant = Instant.now(clock),
     ) {
-        enqueue(listOf(OutboxItem.Event(name, properties, occurredAt)))
+        enqueue(listOf(OutboxItem.Event(name, mergedEventProperties(properties), occurredAt)))
     }
 
     /**
@@ -698,7 +753,7 @@ class SalesClient(
      */
     fun trackBatch(events: List<SalesEvent>) {
         if (events.isEmpty()) return
-        enqueue(events.map { OutboxItem.Event(it.name, it.properties, it.occurredAt) })
+        enqueue(events.map { OutboxItem.Event(it.name, mergedEventProperties(it.properties), it.occurredAt) })
     }
 
     /**

@@ -4,6 +4,30 @@ All notable changes to the SalesCentral Android SDK are tracked here. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [semver](https://semver.org).
 
+## [1.2.1] - 2026-09-11
+
+Event-tracking parity with the Swift SDK: every `track`-side API it has —
+the outbox, enqueue-time `occurredAt`, `flush()`, and now registered event
+properties (Swift 1.3.2) — exists here with the same semantics, bar the
+deliberate never-send-directly delivery difference documented under 1.2.0.
+
+### Added
+- **Registered event ("super") properties** (port of Swift 1.3.2).
+  `SalesClient.setEventProperties(mapOf(...))` — and `setEventProperty` /
+  `removeEventProperty` / `clearEventProperties`, all forwarded by
+  `SalesStore` too — registers properties the SDK merges into every
+  subsequent `track` / `trackBatch` event, so a persistent trait segments
+  event analytics without being passed at each call site. Per-call
+  properties override a registered key; the merge happens at ENQUEUE time,
+  so an event queued before the user exists carries the values registered
+  when it was tracked, not when it flushes. In-memory (re-register each
+  launch) and untouched by `clearUser()`, same as iOS. Values take the same
+  shapes as `track`'s `properties` (`Map<String, Any?>`); a null value rides
+  as JSON null exactly like a null per-call property. Typical use: an
+  analytics-only app that handles subscriptions elsewhere registers
+  `"plan" to "premium"|"trial"|"free"` from its subscription callback, then
+  segments events by `properties.plan` in the admin.
+
 ## [1.2.0] - 2026-09-11
 
 Analytics parity with the Swift SDK's outbox (1.3.1+). Every existing call

@@ -225,6 +225,22 @@ class SalesStore(val client: SalesClient) {
         client.track(name, properties, occurredAt)
     }
 
+    /**
+     * Register event ("super") properties merged into every subsequent
+     * [track] call — see [SalesClient.setEventProperties]. In-memory; safe
+     * to call before [bootstrap].
+     */
+    fun setEventProperties(properties: Map<String, Any?>) = client.setEventProperties(properties)
+
+    /** Register (or update) a single event property. See [SalesClient.setEventProperty]. */
+    fun setEventProperty(key: String, value: Any?) = client.setEventProperty(key, value)
+
+    /** Stop attaching [key] to future events. See [SalesClient.removeEventProperty]. */
+    fun removeEventProperty(key: String) = client.removeEventProperty(key)
+
+    /** Drop all registered event properties. See [SalesClient.clearEventProperties]. */
+    fun clearEventProperties() = client.clearEventProperties()
+
     // ------------------------------------------------------------------
     // Convenience accessors
     // ------------------------------------------------------------------
