@@ -46,10 +46,10 @@ internal object JsonUtil {
     /** Optional int — null when missing or not a number. */
     fun optInt(o: JSONObject, key: String): Int? {
         if (!o.has(key) || o.isNull(key)) return null
-        return when (val v = o.opt(key)) {
-            is Number -> v.toInt()
-            else -> null
-        }
+        // Same semantics as the former `when (v) { is Number -> v.toInt(); else -> null }`;
+        // spelled this way because Kotlin 2.4's K2 reports that `when` (despite its `else`)
+        // as UNEXHAUSTIVE_WHEN_BASED_ON_JAVA_ANNOTATIONS for org.json's un-annotated opt().
+        return (o.opt(key) as? Number)?.toInt()
     }
 
     /** Optional boolean — null when missing or not a boolean. */

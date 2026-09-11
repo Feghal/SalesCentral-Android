@@ -54,7 +54,10 @@ Design details: `docs/superpowers/specs/2026-07-09-google-play-backend-design.md
 
 ## Install
 
-The SDK is an Android library module (`com.salescentral.sdk`, minSdk 26).
+The SDK is an Android library module (`com.salescentral.sdk`, minSdk 26, compileSdk 37).
+Since 1.1.0 it is built with AGP 9 (built-in Kotlin) and Play Billing Library 9, so a
+consuming app needs **AGP 9.1+ and compileSdk 37+** (AGP 9 enforces the same-or-higher
+compileSdk rule for library consumers by default).
 
 **Option A — JitPack** (from the public mirror, recommended):
 
@@ -69,7 +72,7 @@ dependencyResolutionManagement {
 
 // app/build.gradle.kts
 dependencies {
-    implementation("com.github.Feghal:SalesCentral-Android:1.0.0")
+    implementation("com.github.Feghal:SalesCentral-Android:1.1.0")
 }
 ```
 
@@ -335,7 +338,8 @@ cd sdk/android
 ./gradlew :salescentral:assembleRelease     # AAR
 ```
 
-Requires JDK 17+ and an Android SDK (platform 34). The unit tests inject a
+Requires JDK 17+ and an Android SDK (platform 37 — AGP downloads it on first build when
+the SDK licence is accepted). The unit tests inject a
 `FakeTransport`, so no device or network is needed.
 
 ## License

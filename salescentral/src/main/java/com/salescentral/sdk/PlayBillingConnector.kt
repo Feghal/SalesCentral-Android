@@ -8,14 +8,16 @@ import com.android.billingclient.api.BillingClientStateListener
 import com.android.billingclient.api.BillingFlowParams
 import com.android.billingclient.api.BillingResult
 import com.android.billingclient.api.ConsumeParams
+import com.android.billingclient.api.PendingPurchasesParams
 import com.android.billingclient.api.ProductDetails
 import com.android.billingclient.api.Purchase
 import com.android.billingclient.api.PurchasesUpdatedListener
 import com.android.billingclient.api.QueryProductDetailsParams
+import com.android.billingclient.api.QueryProductDetailsResult
 import com.android.billingclient.api.QueryPurchasesParams
+import com.android.billingclient.api.UnfetchedProduct
 import com.android.billingclient.api.acknowledgePurchase
 import com.android.billingclient.api.consumePurchase
-import com.android.billingclient.api.queryProductDetails
 import com.android.billingclient.api.queryPurchasesAsync
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -86,7 +88,13 @@ class PlayBillingConnector(
 
     private val billingClient: BillingClient = BillingClient.newBuilder(context.applicationContext)
         .setListener(listener)
-        .enablePendingPurchases()
+        // Play Billing 7 replaced the no-arg enablePendingPurchases() (removed in 8.0) with
+        // this params form; enableOneTimeProducts() alone is Google's documented functional
+        // equivalent of the old call, so pending-purchase behaviour is unchanged: one-time
+        // products may go PENDING (finishPurchase returns PurchaseResult.Pending, the
+        // observer uploads them once they resolve). Prepaid-plan pending transactions are
+        // deliberately NOT opted into — that would be a behaviour change, not a migration.
+        .enablePendingPurchases(PendingPurchasesParams.newBuilder().enableOneTimeProducts().build())
         .build()
 
     private val connectMutex = Mutex()
@@ -173,6 +181,7 @@ class PlayBillingConnector(
         val inapp = ids.filter { catalog[it]?.isSubscription != true }
 
         val found = mutableMapOf<String, ProductDetails>()
+        val unfetched = mutableListOf<UnfetchedProduct>()
         suspend fun query(type: String, productIds: List<String>) {
             if (productIds.isEmpty()) return
             val params = QueryProductDetailsParams.newBuilder()
@@ -185,26 +194,56 @@ class PlayBillingConnector(
                     },
                 )
                 .build()
-            val result = billingClient.queryProductDetails(params)
-            if (result.billingResult.responseCode != BillingClient.BillingResponseCode.OK) {
+            val (billingResult, result) = queryProductDetails(params)
+            if (billingResult.responseCode != BillingClient.BillingResponseCode.OK) {
                 throw SalesError.Network(
-                    "Play product query failed: ${result.billingResult.debugMessage} " +
-                        "(${result.billingResult.responseCode})",
+                    "Play product query failed: ${billingResult.debugMessage} " +
+                        "(${billingResult.responseCode})",
                 )
             }
-            result.productDetailsList?.forEach { found[it.productId] = it }
+            result?.productDetailsList?.forEach { found[it.productId] = it }
+            result?.unfetchedProductList?.let { unfetched += it }
         }
         query(BillingClient.ProductType.SUBS, subs)
         query(BillingClient.ProductType.INAPP, inapp)
 
         if (found.size < ids.size) {
-            val missing = ids.filter { it !in found }
+            // Play Billing 8+ reports WHY a product came back empty (unknown id, wrong
+            // type, no eligible offer) instead of silently omitting it — surface that
+            // per id so a misregistered SKU is diagnosable from the log alone.
+            val reasons = unfetched.associate { it.productId to unfetchedReason(it.statusCode) }
+            val missing = ids.filter { it !in found }.sorted()
             SalesLog.warn(
                 SalesLog.Category.STORE,
-                "loadProducts — Google Play did not return: ${missing.sorted().joinToString(", ")}",
+                "loadProducts — Google Play did not return: " +
+                    missing.joinToString(", ") { id -> reasons[id]?.let { "$id ($it)" } ?: id },
             )
         }
         return ids.mapNotNull { found[it] }
+    }
+
+    /**
+     * Play Billing 8 changed [ProductDetailsResponseListener][com.android.billingclient.api.ProductDetailsResponseListener]
+     * to deliver a [QueryProductDetailsResult] (fetched + unfetched products) instead of a
+     * bare list. The billing-ktx `queryProductDetails` suspend wrapper still flattens that
+     * back to the list and drops the unfetched half, so this bridges the raw async API
+     * directly to keep the per-product status codes [loadProducts] logs.
+     */
+    private suspend fun queryProductDetails(
+        params: QueryProductDetailsParams,
+    ): Pair<BillingResult, QueryProductDetailsResult?> {
+        val deferred = CompletableDeferred<Pair<BillingResult, QueryProductDetailsResult?>>()
+        billingClient.queryProductDetailsAsync(params) { billingResult, result ->
+            deferred.complete(billingResult to result)
+        }
+        return deferred.await()
+    }
+
+    private fun unfetchedReason(code: Int): String = when (code) {
+        UnfetchedProduct.StatusCode.INVALID_PRODUCT_ID_FORMAT -> "invalid product id format"
+        UnfetchedProduct.StatusCode.PRODUCT_NOT_FOUND -> "product not found"
+        UnfetchedProduct.StatusCode.NO_ELIGIBLE_OFFER -> "no eligible offer"
+        else -> "status $code"
     }
 
     // ------------------------------------------------------------------
