@@ -4,6 +4,23 @@ All notable changes to the SalesCentral Android SDK are tracked here. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [semver](https://semver.org).
 
+## [1.3.0] - 2026-09-11
+
+### Added
+- **Server-driven analytics-only.** Every config bundle (`createOrFetchUser`,
+  `restoreUser`) carries the server's per-platform `analyticsOnly`
+  (Settings → Android → Analytics-only (Android) in the admin). When it is
+  on, `SalesCentral.start()` skips the Play Billing observer, the product
+  prefetch and the subscription fetch, `SalesStore.refreshSubscription()`
+  is a no-op, and transaction APIs (`loadProducts` / `purchase` /
+  `applyReceipts` / `currentSubscription` / `spendCredits` / `claimReward` /
+  `restorePurchases`) throw `SalesError.InvalidState("analytics_only")` — no
+  `SalesCentral.json` key, no app update. Cached in the `TokenStore`
+  (`SharedPreferences` in the default store) so relaunches are correct
+  before bootstrap.
+- `TokenStore.readServerAnalyticsOnly()` / `writeServerAnalyticsOnly(...)`
+  with default implementations, so custom stores keep compiling.
+
 ## [1.2.1] - 2026-09-11
 
 Event-tracking parity with the Swift SDK: every `track`-side API it has —

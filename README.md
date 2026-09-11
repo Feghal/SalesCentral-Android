@@ -44,6 +44,18 @@ Apple's webhook. The server also lazily re-validates any Play subscription
 that looks expired, so a missed notification self-heals on the next
 app foreground.
 
+### Analytics-only
+
+For an Android app that uses SalesCentral for analytics, identity and push
+only, turn on **Analytics-only (Android)** under the app's Settings →
+Android in the admin. There is no `SalesCentral.json` key: on SDK 1.3.0+
+the server tells the SDK at launch, which then skips the Play Billing
+observer, the product prefetch and the subscription fetch, and transaction
+APIs throw `SalesError.InvalidState("analytics_only")`. Real devices are
+admitted as real users (not sandbox) even without Play Integrity. Older SDK
+builds still get the admission and simply keep doing the harmless billing
+setup.
+
 Optional, recommended at scale: enable "Manage and download my response
 encryption keys" in Play Console → App integrity and paste the two keys
 into the same admin card — integrity tokens are then verified locally
