@@ -35,15 +35,6 @@ excluded from production analytics, and Play purchases are rejected —
 the SDK leaves rejected purchases unacknowledged, so Google auto-refunds
 them after 3 days and no money is silently kept.
 
-For **subscriptions**, also connect Real-Time Developer Notifications:
-create a Cloud Pub/Sub topic, point Play Console → Monetization setup →
-RTDN at it, and add a push subscription targeting the app's
-**"Google Play RTDN"** URL (shown on the admin App Detail page). Renewals,
-cancellations, revocations and refunds then arrive server-side like
-Apple's webhook. The server also lazily re-validates any Play subscription
-that looks expired, so a missed notification self-heals on the next
-app foreground.
-
 ### Analytics-only
 
 For an Android app that uses SalesCentral for analytics, identity and push
@@ -55,6 +46,15 @@ APIs throw `SalesError.InvalidState("analytics_only")`. Real devices are
 admitted as real users (not sandbox) even without Play Integrity. Older SDK
 builds still get the admission and simply keep doing the harmless billing
 setup.
+
+For **subscriptions**, also connect Real-Time Developer Notifications:
+create a Cloud Pub/Sub topic, point Play Console → Monetization setup →
+RTDN at it, and add a push subscription targeting the app's
+**"Google Play RTDN"** URL (shown on the admin App Detail page). Renewals,
+cancellations, revocations and refunds then arrive server-side like
+Apple's webhook. The server also lazily re-validates any Play subscription
+that looks expired, so a missed notification self-heals on the next
+app foreground.
 
 Optional, recommended at scale: enable "Manage and download my response
 encryption keys" in Play Console → App integrity and paste the two keys
