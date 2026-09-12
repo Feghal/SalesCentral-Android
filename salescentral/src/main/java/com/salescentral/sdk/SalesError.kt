@@ -48,6 +48,14 @@ sealed class SalesError(message: String, cause: Throwable? = null) : Exception(m
      * retry cannot double-apply, and Play auto-refunds a purchase that stays
      * unacknowledged for ≈3 days, so nothing is silently kept. [code] and
      * [isClientError] read through to [cause].
+     *
+     * One precision: `finishPurchase` is also reached through
+     * `applyOwnedPurchase` (an `ITEM_ALREADY_OWNED` re-buy), where the
+     * purchase may already be acknowledged and uploaded. On that path nothing
+     * new was charged, and an already-acknowledged purchase is not picked up
+     * by `sweepUnacknowledged` — the entitlement is what bootstrap / restore
+     * reflect instead. The error class is the same; only the "you are charged
+     * and it will be re-uploaded" reading is specific to a fresh purchase.
      */
     class ReceiptUpload(val productId: String, override val cause: SalesError) :
         SalesError("Receipt upload failed for $productId: ${cause.message}", cause)

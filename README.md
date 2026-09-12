@@ -172,14 +172,19 @@ and the three cases need three different responses —
 ```kotlin
 suspend fun restore(store: SalesStore) {
     when (val outcome = store.restorePurchasesResult()) {
-        is RestorePurchasesOutcome.Completed -> when {
-            // Premium after the restore: close the paywall.
-            store.isPaid -> dismissPaywall()
-            // Restore succeeded but the subscription check itself failed — say
-            // so; the user may well be paying. Never show this as "nothing found".
-            outcome.subscriptionRefreshError != null -> showError(outcome.subscriptionRefreshError)
-            // By far the most common tap: nothing linked to this account.
-            else -> showNothingToRestore()
+        is RestorePurchasesOutcome.Completed -> {
+            // A local copy: `subscriptionRefreshError` is a public property of
+            // another module, so Kotlin will not smart-cast it after a null check.
+            val refreshError = outcome.subscriptionRefreshError
+            when {
+                // Premium after the restore: close the paywall.
+                store.isPaid -> dismissPaywall()
+                // Restore succeeded but the subscription check itself failed — say
+                // so; the user may well be paying. Never show this as "nothing found".
+                refreshError != null -> showError(refreshError)
+                // By far the most common tap: nothing linked to this account.
+                else -> showNothingToRestore()
+            }
         }
         is RestorePurchasesOutcome.Failed -> showError(outcome.error) // offline, 4xx/5xx, analytics_only
     }

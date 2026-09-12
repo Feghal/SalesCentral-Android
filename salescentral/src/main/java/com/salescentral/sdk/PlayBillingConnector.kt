@@ -364,6 +364,9 @@ class PlayBillingConnector(
             // failure: Play has charged the user by now, which a caller
             // cannot tell from a pre-dialog Network/Http otherwise (see
             // SalesError.ReceiptUpload for the observer's retry points).
+            // Via applyOwnedPurchase (ITEM_ALREADY_OWNED) the purchase may
+            // already be acknowledged: nothing new was charged there and the
+            // sweep won't revisit it — same error class, see the KDoc.
             client.unclaimTransaction(txnId)
             val cause = e as? SalesError ?: SalesError.Network(e.message ?: e.javaClass.simpleName)
             SalesLog.warn(SalesLog.Category.STORE, "purchase($productId) — receipt upload failed, left unacknowledged for the observer: ${cause.message}")

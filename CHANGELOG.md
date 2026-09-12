@@ -52,8 +52,13 @@ call site keeps compiling; see "Changed" for the one thrown-type change.
   branch on `ReceiptUpload` first. Failures BEFORE Play charged anything
   (connection, product lookup, dialog launch) are thrown exactly as before.
 - `SalesError`'s base constructor gained an optional `cause` (default null)
-  so `ReceiptUpload` chains its cause into `Throwable.cause` — no existing
-  subtype changed.
+  so `ReceiptUpload` chains its cause into `Throwable.cause`. No existing
+  subtype's constructor, message or `code` / `isClientError` changed, but
+  every subtype now goes through `Exception(message, cause)`, which
+  initialises `Throwable`'s cause slot (to null) where `Exception(message)`
+  left it unset — so a caller that used to `initCause(...)` a `SalesError`
+  after the fact now gets `IllegalStateException` from `Throwable`. The SDK
+  never did that; noted for completeness.
 
 ## [1.3.0] - 2026-09-11
 
