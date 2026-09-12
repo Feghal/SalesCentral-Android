@@ -22,10 +22,28 @@ import java.time.Instant
  *
  * Owned by [SalesStore]; you don't normally construct this directly.
  */
-class SessionTracker(private val client: SalesClient) {
+class SessionTracker internal constructor(
+    private val client: SalesClient,
+    /**
+     * Where the process lifecycle comes from. Production reads
+     * [ProcessLifecycleOwner]; the JVM tests hand in a counting fake, which
+     * is the only way to observe how many observers [start] registered.
+     */
+    private val lifecycleProvider: () -> Lifecycle,
+) {
+
+    constructor(client: SalesClient) : this(client, { ProcessLifecycleOwner.get().lifecycle })
 
     private var startedAt: Instant? = null
+
+    /**
+     * The registered observer, or null. Guarded by [observerLock]: two
+     * concurrent [start] calls (a bootstrap racing an app's own defensive
+     * one) used to both pass an unsynchronised null check and register two
+     * observers, i.e. record every session twice (1.4.1).
+     */
     private var observer: LifecycleEventObserver? = null
+    private val observerLock = Any()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
     /**
@@ -34,44 +52,52 @@ class SessionTracker(private val client: SalesClient) {
      */
     var onForeground: (suspend () -> Unit)? = null
 
-    /** Begin tracking. Idempotent. Callable from any thread. */
+    /**
+     * Begin tracking. Idempotent and thread-safe: concurrent callers
+     * register exactly one observer. Callable from any thread.
+     */
     fun start() {
-        if (observer != null) return
-        val obs = LifecycleEventObserver { _: LifecycleOwner, event: Lifecycle.Event ->
-            when (event) {
-                Lifecycle.Event.ON_START -> foreground()
-                Lifecycle.Event.ON_STOP -> background()
-                else -> {}
-            }
-        }
-        try {
-            val lifecycle = ProcessLifecycleOwner.get().lifecycle
-            runOnMainThread {
-                try {
-                    lifecycle.addObserver(obs)
-                    // If the app boots with the process already foregrounded,
-                    // count from now.
-                    if (lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
-                        startedAt = Instant.now()
-                    }
-                } catch (t: Throwable) {
-                    SalesLog.warn(SalesLog.Category.SESSION, "session tracking unavailable: ${t.message}")
+        synchronized(observerLock) {
+            if (observer != null) return
+            val obs = LifecycleEventObserver { _: LifecycleOwner, event: Lifecycle.Event ->
+                when (event) {
+                    Lifecycle.Event.ON_START -> foreground()
+                    Lifecycle.Event.ON_STOP -> background()
+                    else -> {}
                 }
             }
-            observer = obs
-        } catch (t: Throwable) {
-            // No process lifecycle here (e.g. plain-JVM unit tests) —
-            // sessions just aren't tracked.
-            SalesLog.warn(SalesLog.Category.SESSION, "session tracking unavailable: ${t.message}")
+            try {
+                val lifecycle = lifecycleProvider()
+                runOnMainThread {
+                    try {
+                        lifecycle.addObserver(obs)
+                        // If the app boots with the process already foregrounded,
+                        // count from now.
+                        if (lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
+                            startedAt = Instant.now()
+                        }
+                    } catch (t: Throwable) {
+                        SalesLog.warn(SalesLog.Category.SESSION, "session tracking unavailable: ${t.message}")
+                    }
+                }
+                observer = obs
+            } catch (t: Throwable) {
+                // No process lifecycle here (e.g. plain-JVM unit tests) —
+                // sessions just aren't tracked.
+                SalesLog.warn(SalesLog.Category.SESSION, "session tracking unavailable: ${t.message}")
+            }
         }
     }
 
     fun stop() {
-        val obs = observer ?: return
-        observer = null
+        val obs = synchronized(observerLock) {
+            val current = observer ?: return
+            observer = null
+            current
+        }
         startedAt = null
         try {
-            val lifecycle = ProcessLifecycleOwner.get().lifecycle
+            val lifecycle = lifecycleProvider()
             runOnMainThread {
                 try {
                     lifecycle.removeObserver(obs)

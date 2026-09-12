@@ -6,10 +6,8 @@ import android.content.Context
 import android.content.pm.ApplicationInfo
 import com.android.billingclient.api.ProductDetails
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.async
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -59,13 +57,6 @@ object SalesCentral {
     private var _bootstrapped = false
 
     /**
-     * In-flight (or already-resolved) job for loading the app's configured
-     * Play products. [start] kicks this off right after bootstrap.
-     * Concurrent [loadProducts] callers await the same job.
-     */
-    private var _productsTask: Deferred<List<ProductDetails>>? = null
-
-    /**
      * Watches for network reconnection to retry a bootstrap that failed
      * offline. Created lazily on failure, stopped once bootstrap succeeds.
      */
@@ -73,6 +64,20 @@ object SalesCentral {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val configLock = Any()
+
+    /**
+     * The single-flight job for the app's configured Play products, shared by
+     * [start]'s prefetch, [loadProducts] and [reloadProducts]. Retains only a
+     * fetch that succeeded with products and never starts one before the
+     * SKU list is known — see [ProductsLoader] for the rule and why (1.4.1:
+     * a pre-bootstrap `loadProducts()` used to pin an empty list for the
+     * whole process).
+     */
+    private val products = ProductsLoader<ProductDetails>(
+        scope,
+        configuredIds = { shared.configuredProductIds },
+        fetch = { forceRefreshIds -> fetchProductsFromPlay(forceRefreshIds) },
+    )
 
     // Serializes start() — the Kotlin analog of the Swift facade's
     // @MainActor isolation. Guards _bootstrapped and the observer /
@@ -132,11 +137,10 @@ object SalesCentral {
             // admin has registered for this app (returned from createOrFetchUser).
             // Kick off the Play lookup in the background — loadProducts() awaits
             // the same job. Don't await it here so first paint isn't blocked.
-            synchronized(configLock) {
-                if (_productsTask == null) {
-                    _productsTask = scope.async { fetchProductsFromPlay() }
-                }
-            }
+            // Anything a pre-bootstrap / offline attempt left behind is gone
+            // by now (ProductsLoader keeps only in-flight or non-empty jobs),
+            // so this never inherits an empty or failed result.
+            products.prefetch()
         }
     }
 
@@ -201,8 +205,7 @@ object SalesCentral {
     fun reset() {
         synchronized(configLock) {
             SalesLog.debug(SalesLog.Category.SDK, "reset() — clearing configuration")
-            _productsTask?.cancel()
-            _productsTask = null
+            products.reset()
             _reconnectMonitor?.stop()
             _reconnectMonitor = null
             _client?.shutdownOutbox()
@@ -277,11 +280,18 @@ object SalesCentral {
      * launch, without an app update.
      *
      * Behavior:
-     *   - If [start] already kicked off the load and it finished:
-     *     returns the cached list immediately.
-     *   - If [start] kicked it off but it's still running: awaits.
-     *   - If [start] hasn't completed bootstrap yet: starts the product
-     *     load now, then awaits.
+     *   - If [start] already kicked off the load and it finished with
+     *     products: returns the cached list immediately.
+     *   - If a load is in flight ([start]'s prefetch or another caller's):
+     *     awaits it.
+     *   - If [start] hasn't completed bootstrap yet — the SDK does not know
+     *     the SKU list — returns an empty list WITHOUT caching it; the next
+     *     call (or [start]'s prefetch once bootstrap lands) fetches for real.
+     *     Gate your paywall on bootstrap (`store.user` non-null) if an empty
+     *     answer here is not acceptable. Same empty, uncached answer when
+     *     the admin registered no products.
+     *   - A load that failed (Play unreachable) or came back empty is not
+     *     retained either: the next call retries instead of replaying it.
      *
      * Concurrent callers all share the same in-flight job. Use
      * [reloadProducts] to force a fresh fetch (e.g. after the operator
@@ -289,14 +299,8 @@ object SalesCentral {
      */
     suspend fun loadProducts(): List<ProductDetails> {
         guardTransactionsAllowed("loadProducts") // also throws a descriptive error when unconfigured (via shared)
-        val task = synchronized(configLock) {
-            _productsTask ?: run {
-                SalesLog.debug(SalesLog.Category.STORE, "loadProducts() — no prefetch in flight, fetching on demand")
-                scope.async { fetchProductsFromPlay() }.also { _productsTask = it }
-            }
-        }
         return try {
-            task.await().also {
+            products.load().also {
                 SalesLog.info(SalesLog.Category.STORE, "loadProducts() returned ${it.size} product(s)")
             }
         } catch (e: Exception) {
@@ -308,15 +312,14 @@ object SalesCentral {
     /**
      * Force a refetch of the registered SKUs + Play lookup. Use after an
      * admin-panel change you want to pick up without restarting the app.
-     * Otherwise [start] does this once per launch.
+     * Otherwise [start] does this once per launch. Replaces the retained
+     * list; a failed or empty refetch is not retained (see [loadProducts]).
      */
     suspend fun reloadProducts(): List<ProductDetails> {
         guardTransactionsAllowed("reloadProducts")
         SalesLog.info(SalesLog.Category.STORE, "reloadProducts() — refetching SKUs + Play lookup")
-        val task = scope.async { fetchProductsFromPlay(forceRefreshIds = true) }
-        synchronized(configLock) { _productsTask = task }
         return try {
-            task.await().also {
+            products.reload().also {
                 SalesLog.info(SalesLog.Category.STORE, "reloadProducts() returned ${it.size} product(s)")
             }
         } catch (e: Exception) {
@@ -502,7 +505,10 @@ object SalesCentral {
  * folded into one ergonomic call. The SDK already prefetched every
  * registered product during [SalesCentral.start] (or on first
  * [SalesCentral.loadProducts] access), so this is just an in-memory filter
- * most of the time — no extra Play round-trip per paywall.
+ * most of the time — no extra Play round-trip per paywall. Before bootstrap
+ * has delivered the SKU list this resolves to an empty list that is not
+ * cached (see [SalesCentral.loadProducts]) — gate the paywall on
+ * `store.user` if that matters.
  *
  * The returned list preserves `paywall.productIds` order so the operator's
  * chosen display order is honoured. SKUs the admin lists that Google Play

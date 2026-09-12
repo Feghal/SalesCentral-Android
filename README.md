@@ -84,7 +84,7 @@ dependencyResolutionManagement {
 
 // app/build.gradle.kts
 dependencies {
-    implementation("com.github.Feghal:SalesCentral-Android:1.4.0")
+    implementation("com.github.Feghal:SalesCentral-Android:1.4.1")
 }
 ```
 
@@ -232,6 +232,14 @@ suspend fun buy(activity: Activity, product: ProductDetails) {
 // Or skip the load step entirely:
 SalesCentral.purchase(activity, productId = "com.foo.pro.monthly")
 ```
+
+`loadProducts()` awaits the prefetch `start()` kicks off after bootstrap and
+serves it from memory afterwards. Before bootstrap has delivered the SKU list
+(a paywall opened during the launch window, or after an offline launch) it
+returns an empty list that is **not** cached — the next call fetches for
+real — so gate a paywall on `store.user` being non-null if an empty answer
+there is not acceptable. A fetch that failed or came back empty is not
+cached either; the next call retries.
 
 `purchase()` drives the Play dialog, uploads the receipt, applies effects,
 **acknowledges the purchase only after the server accepts it** (Google
@@ -434,7 +442,7 @@ for tests via `SalesConfig(tokenStore = InMemoryTokenStore())` +
 
 ```bash
 cd sdk/android
-./gradlew :salescentral:testDebugUnitTest   # JVM unit tests (95)
+./gradlew :salescentral:testDebugUnitTest   # JVM unit tests (114)
 ./gradlew :salescentral:assembleRelease     # AAR
 ```
 

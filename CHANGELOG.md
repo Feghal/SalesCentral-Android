@@ -4,6 +4,52 @@ All notable changes to the SalesCentral Android SDK are tracked here. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [semver](https://semver.org).
 
+## [1.4.1] - 2026-09-12
+
+Three fixes from the consuming app's P1 phase review. No signature changes;
+every existing call site keeps compiling and behaving, except where noted
+as the fix.
+
+### Fixed
+- **A pre-bootstrap `loadProducts()` no longer poisons the product cache.**
+  `SalesCentral.loadProducts()` used to cache its first fetch for the life
+  of the process whatever it produced — and a call made before `start()`
+  had absorbed the config bundle (the SKU list still empty; a paywall
+  opened during the bootstrap window, or after an offline launch) produced
+  an empty list, so every later paywall stayed empty until relaunch even
+  after bootstrap succeeded. The cache (`ProductsLoader`, internal) now
+  retains a fetch only when it succeeded with at least one product: a
+  fetch that failed (Play unreachable) or came back empty evicts itself as
+  it finishes, and `loadProducts()` does not start one at all while no SKU
+  is known — it answers an empty list without caching it, so the next call
+  (or `start()`'s prefetch once bootstrap lands) fetches for real.
+  Concurrent callers still share one in-flight job; `reloadProducts()`
+  still forces a fresh one. The `loadProducts()` KDoc, which claimed a
+  pre-bootstrap call "starts the product load now", now describes this.
+  Gate a paywall on bootstrap (`store.user` non-null) if an empty
+  pre-bootstrap answer is not acceptable.
+- **Observer-path grants reach `SalesStore.user`.** After the Play observer
+  uploaded an out-of-band purchase (a pending consumable resolving, the
+  launch sweep after a process death, a purchase completing after its
+  screen was gone), it called `store.refreshSubscription()`, which copied
+  only `premium` onto the store's own stale user — the credits the upload
+  had already put on `SalesClient.currentUser` never reached `user.credits`.
+  `refreshSubscription()` now rebuilds `user` from the client's snapshot
+  (when there is one) and applies the fetched `premium` on top; premium
+  still comes from the GET alone, and a failed GET still leaves `user` /
+  `subscription` untouched. Subscriptions were unaffected; this is
+  consumables only.
+- **`SessionTracker.start()` is thread-safe.** Its idempotency guard was an
+  unsynchronised null check, so two bootstraps racing each other (the
+  SDK's own and an app's defensive one) could register two process
+  lifecycle observers and record every session twice. The check-and-set
+  is now under a lock; `stop()` uses the same one.
+
+### Added
+- `SessionTracker` gained an `internal` constructor taking the lifecycle
+  provider, so the JVM tests can count registrations; the public
+  `SessionTracker(client)` constructor is unchanged.
+
 ## [1.4.0] - 2026-09-12
 
 Restore and post-purchase failures become distinguishable. Every existing

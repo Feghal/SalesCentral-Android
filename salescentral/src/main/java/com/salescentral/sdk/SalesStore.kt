@@ -196,7 +196,20 @@ class SalesStore(val client: SalesClient) {
      * the server-reconciled premium to the cached user, so [isPaid] / [tier]
      * reflect the latest server state. Lightweight — call on app resume or
      * before showing a paywall. [bootstrap] also wires this to fire
-     * automatically when the app returns to the foreground.
+     * automatically when the app returns to the foreground, and the Play
+     * observer fires it after an out-of-band purchase was applied.
+     *
+     * On success [user] is rebuilt from [SalesClient.currentUser] — the
+     * client's snapshot is updated by every receipt upload, including the
+     * observer path's (`applyReceipts`), which never writes this store — with
+     * the fetched `premium` applied on top. So a consumable that Play
+     * delivered out of band (a pending purchase resolving, the launch sweep
+     * after a process death, a purchase completing after its screen is gone)
+     * shows up in `user.credits.balance` here (1.4.1; before, only `premium`
+     * was copied and the observer-path grant never reached [user]). The
+     * premium always comes from this call's GET, never from the client's
+     * snapshot, which may predate an earlier refresh. A failed GET leaves
+     * [user] and [subscription] untouched.
      *
      * Note: [isPaid] / [tier] are already expiry-aware locally (they respect
      * `expiresAt` with no network), so this is for re-syncing server changes
@@ -210,7 +223,7 @@ class SalesStore(val client: SalesClient) {
             return
         }
         _subscription.value = sub
-        _user.value = _user.value?.copy(premium = sub.premium)
+        _user.value = (client.currentUser ?: _user.value)?.copy(premium = sub.premium)
     }
 
     /** Upload a single receipt — for the post-purchase flow. */
