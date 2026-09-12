@@ -84,7 +84,7 @@ dependencyResolutionManagement {
 
 // app/build.gradle.kts
 dependencies {
-    implementation("com.github.Feghal:SalesCentral-Android:1.3.0")
+    implementation("com.github.Feghal:SalesCentral-Android:1.4.0")
 }
 ```
 
@@ -158,12 +158,42 @@ fun StatusView() {
         Text("Tier: ${store.tier}")
         Text("Credits: ${store.creditBalance}")
         if (store.isInTrial) Text("Free trial active")
-        Button(onClick = { scope.launch { store.restorePurchases() } }) {
+        Button(onClick = { scope.launch { restore(store) } }) {
             Text("Restore Purchases")
         }
     }
 }
 ```
+
+For a restore button call `store.restorePurchasesResult()` (1.4.0+), not the
+fire-and-forget `store.restorePurchases()`: it returns THIS call's outcome,
+and the three cases need three different responses —
+
+```kotlin
+suspend fun restore(store: SalesStore) {
+    when (val outcome = store.restorePurchasesResult()) {
+        is RestorePurchasesOutcome.Completed -> when {
+            // Premium after the restore: close the paywall.
+            store.isPaid -> dismissPaywall()
+            // Restore succeeded but the subscription check itself failed — say
+            // so; the user may well be paying. Never show this as "nothing found".
+            outcome.subscriptionRefreshError != null -> showError(outcome.subscriptionRefreshError)
+            // By far the most common tap: nothing linked to this account.
+            else -> showNothingToRestore()
+        }
+        is RestorePurchasesOutcome.Failed -> showError(outcome.error) // offline, 4xx/5xx, analytics_only
+    }
+}
+```
+
+`Completed.result.restored` is the server's own flag: `true` only when an
+EXISTING user owned one of the device's receipts and was re-linked; `false`
+(a fresh user was created for them, or the device had no purchases at all)
+is a success — it is what most restore taps return — so give it its own
+copy, and never present a `Failed` (the call did not complete) as "nothing to
+restore". `restorePurchases()` still exists for callers that only observe
+the store's flows; its only failure signal is the store-wide `store.lastError`,
+which every other store method writes too.
 
 `store.isPaid` / `store.tier` / `store.isInTrial` are **expiry-aware** —
 they respect `expiresAt` / `trialEndsAt` locally, so a long-running app
@@ -286,6 +316,7 @@ Top-level facade (`SalesCentral.…`):
 | `store` | Shared `SalesStore` with `StateFlow`s for UI. |
 | `store.products` / `store.effects(productId)` | Registered catalog as `List<SalesProduct>` with typed `List<ProductEffect>`. |
 | `store.refreshSubscription()` | Cheap re-pull of subscription + premium. Auto-fires on app foreground. |
+| `store.restorePurchasesResult()` | Restore this device's Play purchases and get THIS call's `RestorePurchasesOutcome` (`Completed` / `Failed`) — the call for a restore button. `store.restorePurchases()` is the fire-and-forget form. |
 | `shared` | Underlying `SalesClient` for direct API calls. |
 | `registerPushToken(token)` / `unregisterPushToken()` | FCM token + notification permission status → backend. |
 
@@ -375,12 +406,22 @@ The error-code table (`insufficient_credits`, `already_claimed`,
 `invalid_user_token`, `endpoint_not_found`, `product_not_registered`, …)
 is identical to the [Swift README](../swift/README.md#error-handling).
 
+One Android-only subtype: `SalesError.ReceiptUpload` (1.4.0+) is what
+`SalesCentral.purchase()` throws when Google Play completed the purchase but
+the receipt upload failed. The user IS charged in that case — the SDK leaves
+the purchase unacknowledged and re-uploads it on the next launch (or refunds
+happen automatically after ≈3 days unacknowledged) — so branch on it before
+`Network` / `Http` and tell the user their payment will be applied
+automatically rather than that nothing happened. `e.cause` is the original
+error; `e.code` / `e.isClientError` read through to it.
+
 ## Token storage
 
 Default store is app-private `SharedPreferences`. Unlike the iOS Keychain
 it does **not** survive uninstall — for paying users the authoritative
-recovery path is `restorePurchases()` (re-links by Play purchases), the
-same way StoreKit entitlements are the authoritative path on iOS. Override
+recovery path is `store.restorePurchasesResult()` (re-links by Play
+purchases; `Completed.result.restored` says whether an existing account was
+found), the same way StoreKit entitlements are the authoritative path on iOS. Override
 for tests via `SalesConfig(tokenStore = InMemoryTokenStore())` +
 `SalesCentral.configure(context, config)`.
 
@@ -388,7 +429,7 @@ for tests via `SalesConfig(tokenStore = InMemoryTokenStore())` +
 
 ```bash
 cd sdk/android
-./gradlew :salescentral:testDebugUnitTest   # JVM unit tests (71)
+./gradlew :salescentral:testDebugUnitTest   # JVM unit tests (95)
 ./gradlew :salescentral:assembleRelease     # AAR
 ```
 

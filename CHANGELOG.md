@@ -4,6 +4,57 @@ All notable changes to the SalesCentral Android SDK are tracked here. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [semver](https://semver.org).
 
+## [1.4.0] - 2026-09-12
+
+Restore and post-purchase failures become distinguishable. Every existing
+call site keeps compiling; see "Changed" for the one thrown-type change.
+
+### Added
+- **`SalesStore.restorePurchasesResult(): RestorePurchasesOutcome`** — the
+  call to wire to a "Restore purchases" button. Runs the same sequence as
+  `restorePurchases()` (analytics-only guard → `restoreUser` → mirror
+  `user` / `products` / `retention` → refresh `subscription`, all before
+  returning) but reports THIS call's outcome instead of collapsing it into
+  the store-wide `lastError`: `Completed(result, subscription,
+  subscriptionRefreshError)` carries the wire `RestoreResult` (whose
+  `restored` means "an existing owner of one of the receipts was found and
+  the device re-linked to it" — not "a receipt was accepted"; see the
+  KDoc) plus whether the follow-up `currentSubscription()` read succeeded,
+  so a caller can tell "no subscription" from "couldn't check";
+  `Failed(error)` carries the `SalesError` with the store left untouched.
+  `lastError` is still written on failure, so existing observers see no
+  change. `restored == false` is a success, and the common one — a button
+  needs its own "nothing to restore" copy for it, and must never show a
+  `Failed` as that.
+- **`SalesError.ReceiptUpload(productId, cause)`** — thrown by
+  `SalesCentral.purchase()` when Google Play completed the purchase but the
+  receipt upload failed. Unlike every other purchase error the user IS
+  charged: the purchase is left unacknowledged with its upload claim
+  released, and the observer re-uploads it on the next process launch
+  (`start()` → `sweepUnacknowledged`, once per process; a foreground return
+  does not re-sweep), earlier only if Play redelivers it or the same product
+  is bought again. `cause` is the original `Network` / `Http` / `Decoding`;
+  `code` / `isClientError` read through to it. Play auto-refunds a purchase
+  that stays unacknowledged ≈3 days, so nothing is silently kept.
+
+### Changed
+- `SalesStore.restorePurchases()` now delegates to `restorePurchasesResult()`
+  and discards the outcome — one code path; its contract (never throws,
+  records failures in `lastError`, mirrors state on success) is unchanged.
+  The one visible difference: a `CancellationException` from a cancelled
+  caller now propagates instead of being recorded as `lastError` (swallowing
+  a cancellation was a bug).
+- **For integrators:** a `purchase()` that used to throw `SalesError.Network`
+  / `SalesError.Http` / `SalesError.Decoding` AFTER Play completed the
+  purchase now throws `SalesError.ReceiptUpload` with the original as
+  `cause`. A `catch (e: SalesError)` still catches it; a `when` over the
+  subtypes that wants the pre-charge meaning of `Network` / `Http` should
+  branch on `ReceiptUpload` first. Failures BEFORE Play charged anything
+  (connection, product lookup, dialog launch) are thrown exactly as before.
+- `SalesError`'s base constructor gained an optional `cause` (default null)
+  so `ReceiptUpload` chains its cause into `Throwable.cause` — no existing
+  subtype changed.
+
 ## [1.3.0] - 2026-09-11
 
 ### Added

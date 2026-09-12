@@ -370,7 +370,10 @@ object SalesCentral {
      * Throws on network errors or backend rejection
      * (e.g. `product_not_registered`). UI should branch on the returned
      * [PurchaseResult] for normal flow outcomes and catch for retryable
-     * failures.
+     * failures — and catch [SalesError.ReceiptUpload] separately: it is the
+     * one thrown failure where Play has already charged the user (the
+     * receipt upload failed afterwards); the SDK re-uploads it on its own,
+     * see that error's doc, so the copy must not read as "nothing happened".
      *
      * [offerToken] selects a specific subscription offer; when null the
      * product's first offer is used.

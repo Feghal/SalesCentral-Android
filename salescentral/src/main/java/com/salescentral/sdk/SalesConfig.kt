@@ -201,5 +201,5 @@ class SalesConfig(
 
 /** SDK constants. Updated when the package is released. */
 object SDKMetadata {
-    const val version = "1.3.0"
+    const val version = "1.4.0"
 }

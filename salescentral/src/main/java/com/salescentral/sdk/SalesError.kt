@@ -7,7 +7,7 @@ package com.salescentral.sdk
  * callers can branch on specific failure modes (e.g. `insufficient_credits`
  * for a paywall). The human-readable `message` is best-effort.
  */
-sealed class SalesError(message: String) : Exception(message) {
+sealed class SalesError(message: String, cause: Throwable? = null) : Exception(message, cause) {
 
     /** The request reached the server but returned a non-2xx response. */
     class Http(val status: Int, val errorCode: String, val serverMessage: String?) :
@@ -31,13 +31,44 @@ sealed class SalesError(message: String) : Exception(message) {
     class AttestUnsupported : SalesError("Device attestation unsupported on this device")
 
     /**
+     * Google Play completed the purchase of [productId] but uploading its
+     * receipt to the backend failed ([cause]: the [Network] / [Http] /
+     * [Decoding] the upload threw, with a non-`SalesError` wrapped as
+     * [Network]). Thrown by [SalesCentral.purchase] in place of the raw
+     * failure because the money state is specific and unlike any other
+     * purchase error: the user IS charged, the server has NOT recorded the
+     * purchase, and the SDK left it unacknowledged with its upload claim
+     * released so the purchase observer re-uploads it — on the next process
+     * launch (`SalesCentral.start` → `PlayBillingConnector.startObserving` →
+     * `sweepUnacknowledged`, which runs once per process after bootstrap;
+     * returning to the foreground does not re-sweep), earlier only if Play
+     * redelivers the purchase to `PurchasesUpdatedListener` in the same
+     * session or the app re-buys the same product (`ITEM_ALREADY_OWNED`
+     * re-applies it). The server is idempotent on transaction id, so the
+     * retry cannot double-apply, and Play auto-refunds a purchase that stays
+     * unacknowledged for ≈3 days, so nothing is silently kept. [code] and
+     * [isClientError] read through to [cause].
+     */
+    class ReceiptUpload(val productId: String, override val cause: SalesError) :
+        SalesError("Receipt upload failed for $productId: ${cause.message}", cause)
+
+    /**
      * The server's `error` code if this is an HTTP error, otherwise null.
-     * Handy for `when (err.code) { … }` paywall / restore flows.
+     * Handy for `when (err.code) { … }` paywall / restore flows. A
+     * [ReceiptUpload] answers with its [ReceiptUpload.cause]'s code.
      */
     val code: String?
-        get() = (this as? Http)?.errorCode
+        get() = when (this) {
+            is Http -> errorCode
+            is ReceiptUpload -> cause.code
+            else -> null
+        }
 
-    /** True for HTTP 4xx, false otherwise. */
+    /** True for HTTP 4xx (through a [ReceiptUpload]'s cause too), false otherwise. */
     val isClientError: Boolean
-        get() = (this as? Http)?.status in 400..499
+        get() = when (this) {
+            is Http -> status in 400..499
+            is ReceiptUpload -> cause.isClientError
+            else -> false
+        }
 }

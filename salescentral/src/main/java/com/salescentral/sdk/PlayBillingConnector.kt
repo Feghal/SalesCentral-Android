@@ -19,6 +19,7 @@ import com.android.billingclient.api.UnfetchedProduct
 import com.android.billingclient.api.acknowledgePurchase
 import com.android.billingclient.api.consumePurchase
 import com.android.billingclient.api.queryPurchasesAsync
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -263,6 +264,13 @@ class PlayBillingConnector(
      *
      * [offerToken] selects a specific subscription offer; when null the
      * first offer is used (the base plan for single-offer products).
+     *
+     * Throws [SalesError.Network] / [SalesError.InvalidState] for failures
+     * BEFORE Play charged anything (connection, product/offer lookup, a
+     * non-OK dialog launch), and [SalesError.ReceiptUpload] when Play
+     * completed the purchase but the receipt upload failed — the one
+     * failure where the user is already charged; see that error's doc for
+     * how the observer retries it.
      */
     suspend fun purchase(
         activity: Activity,
@@ -345,13 +353,21 @@ class PlayBillingConnector(
         val resp: ApplyResult
         try {
             resp = client.applyReceipt(receiptString(purchase))
+        } catch (e: CancellationException) {
+            client.unclaimTransaction(txnId)
+            throw e
         } catch (e: Exception) {
             // Upload failed (offline / server error). Release the claim so
             // the observer can retry this purchase — otherwise it stays
             // claimed and unacknowledged, skipped by the observer until the
-            // next cold launch.
+            // next cold launch. Surface it as ReceiptUpload, not the raw
+            // failure: Play has charged the user by now, which a caller
+            // cannot tell from a pre-dialog Network/Http otherwise (see
+            // SalesError.ReceiptUpload for the observer's retry points).
             client.unclaimTransaction(txnId)
-            throw e
+            val cause = e as? SalesError ?: SalesError.Network(e.message ?: e.javaClass.simpleName)
+            SalesLog.warn(SalesLog.Category.STORE, "purchase($productId) — receipt upload failed, left unacknowledged for the observer: ${cause.message}")
+            throw SalesError.ReceiptUpload(productId, cause)
         }
         // The server accepted the receipt — NOW finish the purchase with
         // Google (the analog of txn.finish()).

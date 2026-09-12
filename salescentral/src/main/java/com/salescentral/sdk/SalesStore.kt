@@ -1,5 +1,6 @@
 package com.salescentral.sdk
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -119,23 +120,75 @@ class SalesStore(val client: SalesClient) {
         }
     }
 
-    suspend fun restorePurchases() {
-        try {
+    /**
+     * Restore this device's Play purchases and report THIS call's outcome —
+     * the call to wire to a "Restore purchases" button. See
+     * [RestorePurchasesOutcome] for what each case means (in particular why
+     * `restored == false` is a success, not a failure, and needs its own
+     * copy); [restorePurchases] is the fire-and-forget variant.
+     *
+     * Runs, in order: the analytics-only guard, [SalesClient.restorePurchases]
+     * with the device's current Play receipts (the provider [SalesCentral]
+     * wires), then mirrors `user` / `products` / `retention` from the
+     * response and refreshes [subscription] with a `currentSubscription()`
+     * read. All of that happens synchronously, before this returns, so a
+     * caller may read [user] / [subscription] `.value` straight after the
+     * call and see the restored state — there is no coroutine hand-off to
+     * race against.
+     *
+     * Never swallows: a failure comes back as [RestorePurchasesOutcome.Failed]
+     * AND is written to [lastError] (so anything observing that flow sees
+     * exactly what it used to), with [user] / [products] / [retention] /
+     * [subscription] left untouched. A failed subscription refresh after a
+     * successful restore is NOT a failure — it is reported on
+     * [RestorePurchasesOutcome.Completed.subscriptionRefreshError] with
+     * [subscription] set to null, as before. A non-[SalesError] exception is
+     * wrapped as [SalesError.Network], as everywhere else in this class; a
+     * `CancellationException` propagates and is never recorded.
+     */
+    suspend fun restorePurchasesResult(): RestorePurchasesOutcome {
+        val result = try {
             if (client.analyticsOnly) throw SalesError.InvalidState("analytics_only")
-            val r = client.restorePurchases()
-            _user.value = r.user
-            _products.value = client.configuredProducts
-            _retention.value = client.retentionStatus
-            _subscription.value = try {
-                client.currentSubscription()
-            } catch (_: Exception) {
-                null
-            }
+            client.restorePurchases()
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: SalesError) {
             _lastError.value = e
+            return RestorePurchasesOutcome.Failed(e)
         } catch (e: Exception) {
-            _lastError.value = SalesError.Network(e.message ?: e.javaClass.simpleName)
+            val wrapped = SalesError.Network(e.message ?: e.javaClass.simpleName)
+            _lastError.value = wrapped
+            return RestorePurchasesOutcome.Failed(wrapped)
         }
+        _user.value = result.user
+        _products.value = client.configuredProducts
+        _retention.value = client.retentionStatus
+        var refreshError: SalesError? = null
+        val subscription = try {
+            client.currentSubscription()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: SalesError) {
+            refreshError = e
+            null
+        } catch (e: Exception) {
+            refreshError = SalesError.Network(e.message ?: e.javaClass.simpleName)
+            null
+        }
+        _subscription.value = subscription
+        return RestorePurchasesOutcome.Completed(result, subscription, refreshError)
+    }
+
+    /**
+     * Fire-and-forget restore for callers that only observe the store's
+     * flows: delegates to [restorePurchasesResult] and discards the outcome,
+     * so there is one restore code path. Never throws — a failure is only
+     * visible through [lastError], which cannot attribute it to this call
+     * rather than any other writer. A restore button wants
+     * [restorePurchasesResult] instead.
+     */
+    suspend fun restorePurchases() {
+        restorePurchasesResult()
     }
 
     /**
